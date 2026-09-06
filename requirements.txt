@@ -20,6 +20,7 @@ tushare==1.4.21
 jqdatasdk==1.9.7
 rqdatac==3.4.7.8
 requests==2.32.3
+dotenv
 
 # Charts and research reporting
 matplotlib==3.8.4
@@ -31,3 +32,5 @@ jupyterlab==4.3.4
 ipykernel==6.29.5
 tqdm==4.67.1
 pytest==8.3.4
+pathlib
+sys

@@ -30,7 +30,8 @@ config_private.*
 
 # Data
 data/raw/
-data/private/
+data/processed/
+data/interim/
 *.db
 *.sqlite
 *.sqlite3
