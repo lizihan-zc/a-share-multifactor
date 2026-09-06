@@ -5,17 +5,20 @@
 
 预处理数据的工作流：
 
-1. 读取原始分区：调用 ``read_date_partitions`` 读取日线、复权因子、每日指标、
-   涨跌停、ST 和停牌数据。
-2. 构建日频面板：调用 ``build_price_daily`` 合并行情相关接口，并统一成交量、
+1. 确定沪深股票范围：调用 ``select_sh_sz_stock_basic`` 从股票基础信息中保留
+   上交所和深交所的人民币股票，并生成股票代码白名单。
+2. 读取并过滤原始数据：调用 ``read_date_partitions`` 读取日线、复权因子、每日
+   指标、涨跌停、ST 和停牌数据；调用 ``filter_stock_records`` 只保留白名单中的
+   沪深股票，不改动 ``data/raw`` 原始文件。
+3. 构建日频面板：调用 ``build_price_daily`` 合并行情相关接口，并统一成交量、
    成交额和市值单位。
-3. 构建财务面板：调用 ``prepare_financial_panel`` 清理报表、计算 TTM 指标并合并
+4. 构建财务面板：调用 ``prepare_financial_panel`` 清理报表、计算 TTM 指标并合并
    资产负债表；随后由 ``attach_latest_reports`` 按公告日匹配当时已知财务数据。
-4. 匹配历史行业：调用 ``attach_historical_industry``，使用 ``in_date`` 和
+5. 匹配历史行业：调用 ``attach_historical_industry``，使用 ``in_date`` 和
    ``out_date`` 确定每个调仓日的申万一级行业。
-5. 构建月度股票池：调用 ``build_monthly_universe``，处理上市状态、上市交易日数、
+6. 构建月度股票池：调用 ``build_monthly_universe``，处理上市状态、上市交易日数、
    ST、停牌、涨停可买性、流动性和核心字段完整性。
-6. 保存结果：调用 ``save_notebook01_outputs``，将 ``price_daily.parquet`` 和
+7. 保存结果：调用 ``save_notebook01_outputs``，将 ``price_daily.parquet`` 和
    ``universe_monthly.parquet`` 写入 ``data/processed``。
 
 如需从原始数据开始执行完整预处理流程，可直接调用 ``run_preprocess_pipeline``；
@@ -26,7 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -35,6 +38,7 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RAW_DIRECTORY = PROJECT_ROOT / "data" / "raw"
 DEFAULT_PROCESSED_DIRECTORY = PROJECT_ROOT / "data" / "processed"
+SH_SZ_EXCHANGES = frozenset({"SSE", "SZSE"})
 
 
 @dataclass(frozen=True)
@@ -79,9 +83,60 @@ def read_date_partitions(directory: Path) -> pd.DataFrame:
     return pd.concat((pd.read_parquet(path) for path in paths), ignore_index=True)
 
 
-def build_price_daily(raw_directory: Path) -> pd.DataFrame:
+def select_sh_sz_stock_basic(stock_basic: pd.DataFrame) -> pd.DataFrame:
+    """从股票基础信息中选出沪深人民币股票。
+
+    股票基础信息是预处理阶段的证券范围权威表。使用交易所和币种而不是仅根据
+    代码后缀过滤，避免将非人民币证券误纳入研究范围。
+    """
+
+    required_columns = {"ts_code", "exchange"}
+    missing_columns = required_columns.difference(stock_basic.columns)
+    if missing_columns:
+        raise ValueError(
+            f"stock_basic 缺少必需字段：{sorted(missing_columns)}"
+        )
+
+    mask = stock_basic["exchange"].isin(SH_SZ_EXCHANGES)
+    if "curr_type" in stock_basic.columns:
+        mask &= stock_basic["curr_type"].eq("CNY")
+    selected = stock_basic.loc[mask].copy()
+    if selected.empty:
+        raise ValueError("stock_basic 中没有可用的沪深人民币股票")
+    return selected.drop_duplicates("ts_code", keep="last").sort_values("ts_code")
+
+
+def filter_stock_records(
+    frame: pd.DataFrame,
+    allowed_stock_codes: Iterable[str],
+    *,
+    code_column: str = "ts_code",
+) -> pd.DataFrame:
+    """按股票代码白名单过滤一张原始或中间表。
+
+    空表会保持原有字段直接返回；非空表必须包含指定的代码字段。该函数只返回
+    过滤后的副本，不会修改 data/raw 中的任何文件。
+    """
+
+    if frame.empty:
+        return frame.copy()
+    if code_column not in frame.columns:
+        raise ValueError(f"数据缺少股票代码字段：{code_column}")
+
+    allowed = {str(code) for code in allowed_stock_codes if pd.notna(code)}
+    if not allowed:
+        raise ValueError("股票代码白名单不能为空")
+    return frame.loc[frame[code_column].astype("string").isin(allowed)].copy()
+
+
+def build_price_daily(
+    raw_directory: Path,
+    *,
+    allowed_stock_codes: Optional[Iterable[str]] = None,
+) -> pd.DataFrame:
     """将日线行情、复权因子、市值和涨跌停价格合并为单一面板。
 
+    如果传入 allowed_stock_codes，则在合并前对所有原始行情表进行统一过滤。
     在此统一 Tushare 的原始单位：成交量转为股、成交额转为元、市值转为元；
     原始文件保持不变。
     """
@@ -91,6 +146,19 @@ def build_price_daily(raw_directory: Path) -> pd.DataFrame:
     missing = [name for name, frame in frames.items() if frame.empty]
     if missing:
         raise FileNotFoundError(f"未找到以下接口的原始分区：{', '.join(missing)}")
+
+    if allowed_stock_codes is not None:
+        allowed = {
+            str(code) for code in allowed_stock_codes if pd.notna(code)
+        }
+        if not allowed:
+            raise ValueError("股票代码白名单不能为空")
+        frames = {
+            name: filter_stock_records(frame, allowed)
+            for name, frame in frames.items()
+        }
+        if frames["daily"].empty:
+            raise ValueError("按股票代码白名单过滤后日线行情为空")
 
     prices = frames["daily"].copy()
     key = ["ts_code", "trade_date"]
@@ -365,12 +433,39 @@ def build_monthly_universe(
 
     rebalance_dates = _monthly_rebalance_dates(calendar)
     monthly = price_daily.merge(rebalance_dates, on="date", how="inner").copy()
+
+    stock_information = stock_basic[
+        ["ts_code", "list_date", "delist_date"]
+    ].rename(columns={"ts_code": "stock_code"})
+    duplicated_codes = stock_information["stock_code"].duplicated(keep=False)
+    if duplicated_codes.any():
+        examples = (
+            stock_information.loc[duplicated_codes, "stock_code"]
+            .drop_duplicates()
+            .head(5)
+        )
+        raise ValueError(
+            "stock_basic 中存在重复股票代码，例如："
+            + ", ".join(examples.astype(str))
+        )
+
+    known_codes = set(stock_information["stock_code"].dropna().astype(str))
+    unknown_codes = sorted(
+        set(monthly["stock_code"].dropna().astype(str)).difference(known_codes)
+    )
+    if unknown_codes:
+        examples = ", ".join(unknown_codes[:5])
+        raise ValueError(
+            "price_daily 中存在 stock_basic 未收录的股票代码："
+            f"共 {len(unknown_codes)} 个，例如 {examples}。"
+            "请在构建日频面板时使用沪深股票白名单。"
+        )
+
     monthly = monthly.merge(
-        stock_basic[["ts_code", "list_date", "delist_date"]].rename(
-            columns={"ts_code": "stock_code"}
-        ),
+        stock_information,
         on="stock_code",
         how="left",
+        validate="many_to_one",
     )
     monthly["list_date"] = _as_timestamp(monthly["list_date"])
     monthly["delist_date"] = _as_timestamp(monthly["delist_date"])
@@ -486,22 +581,43 @@ def run_preprocess_pipeline(
     """读取 ``data/raw`` 并运行完整的 Notebook 01 预处理流程。"""
 
     calendar = pd.read_parquet(raw_directory / "trade_calendar.parquet")
-    stocks = pd.read_parquet(raw_directory / "stock_basic.parquet")
-    income = pd.read_parquet(raw_directory / "income.parquet")
-    balancesheet = pd.read_parquet(raw_directory / "balancesheet.parquet")
-    membership = pd.read_parquet(
-        raw_directory / "sw_industry_membership.parquet"
+    stocks = select_sh_sz_stock_basic(
+        pd.read_parquet(raw_directory / "stock_basic.parquet")
+    )
+    allowed_stock_codes = set(stocks["ts_code"].dropna().astype(str))
+    income = filter_stock_records(
+        pd.read_parquet(raw_directory / "income.parquet"),
+        allowed_stock_codes,
+    )
+    balancesheet = filter_stock_records(
+        pd.read_parquet(raw_directory / "balancesheet.parquet"),
+        allowed_stock_codes,
+    )
+    membership = filter_stock_records(
+        pd.read_parquet(raw_directory / "sw_industry_membership.parquet"),
+        allowed_stock_codes,
+    )
+    st_records = filter_stock_records(
+        read_date_partitions(raw_directory / "stock_st"),
+        allowed_stock_codes,
+    )
+    suspension_records = filter_stock_records(
+        read_date_partitions(raw_directory / "suspend_d"),
+        allowed_stock_codes,
     )
 
-    prices = build_price_daily(raw_directory)
+    prices = build_price_daily(
+        raw_directory,
+        allowed_stock_codes=allowed_stock_codes,
+    )
     financials = prepare_financial_panel(income, balancesheet)
     universe = build_monthly_universe(
         prices,
         calendar,
         stocks,
         financials,
-        st_records=read_date_partitions(raw_directory / "stock_st"),
-        suspension_records=read_date_partitions(raw_directory / "suspend_d"),
+        st_records=st_records,
+        suspension_records=suspension_records,
         industry_membership=membership,
         config=config,
     )
