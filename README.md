@@ -39,7 +39,6 @@ a-share-multifactor/
 │   └── config.yaml
 ├── data/
 │   ├── raw/
-│   ├── interim/
 │   └── processed/
 ├── notebooks/
 │   ├── 01_data_universe.ipynb
@@ -54,9 +53,10 @@ a-share-multifactor/
 │   └── 10_out_of_sample_analysis.ipynb
 ├── src/
 │   ├── data/
-│   │   ├── loader.py
 │   │   ├── universe.py
-│   │   └── preprocess.py
+│   │   ├── preprocess.py
+│   │   ├── clean.py
+│   │   └── label.py
 │   ├── factors/
 │   │   ├── value.py
 │   │   ├── quality.py
@@ -81,9 +81,8 @@ a-share-multifactor/
 
 原则：
 
-- notebook 用于**研究、实验、解释**；
+- `notebooks/` 用于**研究、实验、解释**；
 - `src/` 用于**复用逻辑**；
-- 所有核心计算不要只留在 notebook 里；
 - 图统一输出到 `figures/`；
 - 中间因子面板统一输出到 `data/processed/`。
 
@@ -99,7 +98,7 @@ a-share-multifactor/
 
 A股量化项目最容易被忽略的问题之一，是股票池定义过于理想化。
 
-## 数据范围建议
+## 数据范围
 
 为了兼顾样本量和实现难度，可以先选择：
 
@@ -178,10 +177,24 @@ announcement_date
 
 ## 输出
 
+- 日频股票面板，每行是一只股票在一个交易日的价格、成交量、复权因子、市值和涨跌停状态；
+- 月末股票面板，每行是一只股票在某个月末的行情、财务、行业、上市状态和股票池筛选结果。
+
+将以上两者分别保存为
+
 ```text
-data/processed/universe_monthly.parquet
 data/processed/price_daily.parquet
-figures/universe_size.png
+data/processed/universe_monthly.parquet
+```
+
+注意二者都属于“不平衡面板”：并非每只股票在每个月都有记录，因为股票会新上市、退市、停牌或缺少数据。未来生成的完整研究面板应当是
+
+```text
+(date, stock_code)
++ 当时已知的因子
++ 行业和市值等控制变量
++ 是否可交易
++ future_return_1m
 ```
 
 ## 这一阶段要能回答
@@ -199,19 +212,19 @@ figures/universe_size.png
 
 ## 研究问题
 
-> 在时点 \(t\) 形成的信号，到底预测哪个未来收益？
+> 在时点 $t$ 形成的信号，到底预测哪个未来收益？
 
-必须先把 label 定义清楚，再做因子。
+必须先把 label（模型要预测的目标变量）定义清楚，再做因子。
 
 ## 推荐标签
 
-以月末 \(t\) 作为信号形成时点：
+以月末 $t$ 作为信号形成时点：
 
 $$
 R_{i,t+1}=\frac{P_{i,t+1}}{P_{i,t}}-1
 $$
 
-其中 \(R\_{i,t+1}\) 是下一个调仓周期的收益。
+其中 $R_{i,t+1}$ 是下一个调仓周期的收益。
 
 更严谨时，可以使用：
 
@@ -687,7 +700,7 @@ $$
 Sharpe=\frac{AnnualizedReturn-R_f}{AnnualizedVol}
 $$
 
-学生项目可明确说明暂设 \(R_f=0\)。
+学生项目可明确说明暂设 $R_f=0$。
 
 ### 最大回撤
 
