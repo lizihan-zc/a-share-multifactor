@@ -3,6 +3,8 @@
 本模块只读取 ``data/raw`` 中的原始数据，不调用 Tushare 接口。预处理结果统一写入
 ``data/processed``。
 
+原始数据的形式：？
+
 预处理数据的工作流：
 
 1. 确定沪深股票范围：调用 ``select_sh_sz_stock_basic`` 从股票基础信息中保留
@@ -27,8 +29,15 @@
 
 如需从原始数据开始执行完整预处理流程，可直接调用 ``run_preprocess_pipeline``；
 如只需检查或重跑某一步，则调用对应的单个函数。
+
+要点：
+- 时间要转换成时间戳timestamp
+- 利用 drop_duplicates 去重
+- 统一单位
 """
 
+# annotations 使类型注解主要用于静态类型检查和代码说明，而不会在函数定义时急于解析。
+# 这样更容易引用后面才定义的类，和编写递归或互相引用的类型。
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -39,22 +48,36 @@ import numpy as np
 import pandas as pd
 
 
+# 工作目录和路径
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RAW_DIRECTORY = PROJECT_ROOT / "data" / "raw"
 DEFAULT_PROCESSED_DIRECTORY = PROJECT_ROOT / "data" / "processed"
+# frozenset 是可查询、不可修改的集合，不使用 list 是为了防止运行过程中意外加入 BSE
+# exchange: 交易所
 SH_SZ_EXCHANGES = frozenset({"SSE", "SZSE"})
 GROSS_PROFIT_NOT_APPLICABLE_INDUSTRIES = frozenset({"银行", "非银金融"})
 
 
+# @dataclass 作用于它紧接着修饰的那个类，在定义时无需声明 __init__
+# 它免除了重写一遍属性的麻烦，并且可以 print 以查看类对象
+# frozen=True 表示对象创建后不能修改字段
 @dataclass(frozen=True)
 class UniverseConfig:
-    """定义 Notebook 01 预处理和股票池筛选参数。"""
+    """
+    UniverseConfig 定义一次预处理和股票池筛选参数：
+    研究起止日期；
+    最低上市交易日数；
+    流动性过滤分位数。
+    """
 
     study_start: str
     study_end: str
     min_listing_trading_days: int = 120
+    # 流动性过滤分位数，用来排除调仓日成交额最低的一部分股票
+    # 如果设置了分位数，只有成交额超过分位数的股票会被设置为 monthly["passes_liquidity"] = True
     liquidity_quantile: Optional[float] = None
 
+    # @dataclass 自动完成字段赋值后，会调用这个方法检查参数是否合法
     def __post_init__(self) -> None:
         if pd.Timestamp(self.study_start) > pd.Timestamp(self.study_end):
             raise ValueError("study_start 必须早于或等于 study_end")
@@ -65,7 +88,11 @@ class UniverseConfig:
 
 
 def _write_parquet_atomic(frame: pd.DataFrame, path: Path) -> None:
-    """原子写入 Parquet，防止中断处理生成的残缺文件被复用。"""
+    """
+    原子写入 Parquet，防止中断处理生成的残缺文件被复用。
+    原理是生成一个完整的临时文件代替正式文件，保证程序只能看到替换前的完整旧文件和替换后的完整新文件，
+    不会看到写了一半的新文件。
+    """
 
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
@@ -96,11 +123,15 @@ def select_sh_sz_stock_basic(stock_basic: pd.DataFrame) -> pd.DataFrame:
     """
 
     required_columns = {"ts_code", "exchange"}
+
+    ##### 错误报警
+    # A.difference(B) 返回 A - B, 即在 A 中 而不在 B 中的元素的集合
     missing_columns = required_columns.difference(stock_basic.columns)
     if missing_columns:
         raise ValueError(
             f"stock_basic 缺少必需字段：{sorted(missing_columns)}"
         )
+    #####
 
     mask = stock_basic["exchange"].isin(SH_SZ_EXCHANGES)
     if "curr_type" in stock_basic.columns:
@@ -108,6 +139,7 @@ def select_sh_sz_stock_basic(stock_basic: pd.DataFrame) -> pd.DataFrame:
     selected = stock_basic.loc[mask].copy()
     if selected.empty:
         raise ValueError("stock_basic 中没有可用的沪深人民币股票")
+    # drop_duplicates 根据 ts_code 排除重复股票，每只股票只保留一行
     return selected.drop_duplicates("ts_code", keep="last").sort_values("ts_code")
 
 
@@ -137,6 +169,7 @@ def filter_stock_records(
 def build_price_daily(
     raw_directory: Path,
     *,
+    # * 后面的参数必须使用“参数名=参数值”的关键字形式传入，不能按位置传入。
     allowed_stock_codes: Optional[Iterable[str]] = None,
 ) -> pd.DataFrame:
     """将日线行情、复权因子、市值和涨跌停价格合并为单一面板。
@@ -147,10 +180,14 @@ def build_price_daily(
     """
 
     required = ("daily", "adj_factor", "daily_basic", "stk_limit")
+    # 收集表格。frames: dict
     frames = {name: read_date_partitions(raw_directory / name) for name in required}
+
+    ##### 错误报警
     missing = [name for name, frame in frames.items() if frame.empty]
     if missing:
         raise FileNotFoundError(f"未找到以下接口的原始分区：{', '.join(missing)}")
+    #####
 
     if allowed_stock_codes is not None:
         allowed = {
@@ -165,9 +202,11 @@ def build_price_daily(
         if frames["daily"].empty:
             raise ValueError("按股票代码白名单过滤后日线行情为空")
 
+    # 以 daily 为基础合并其它表格
     prices = frames["daily"].copy()
     key = ["ts_code", "trade_date"]
     for name in ("adj_factor", "daily_basic", "stk_limit"):
+        # 注意去重的字段！每只股票每天保留一行
         frame = frames[name].drop_duplicates(key)
         columns = [
             column
@@ -180,6 +219,8 @@ def build_price_daily(
         columns={
             "ts_code": "stock_code",
             "trade_date": "date",
+            # 当前交易日的前收盘参考价，它可能已经根据分红、送股、拆股等除权除息事件进行了调整
+            # 不一定等于上一交易日的 close
             "pre_close": "prev_close",
             "vol": "volume",
             "total_mv": "market_cap",
@@ -198,6 +239,8 @@ def build_price_daily(
     prices["is_limit_up_close"] = status.isin([2, 3])
     prices["is_limit_down_close"] = status.isin([5, 6])
     tolerance = 1e-8
+    # 识别一字涨停股票，即全天最低成交价 ≥ 涨停价
+    # 一字涨停股票的 is_buyable=False
     prices["is_one_price_limit_up"] = (
         prices["low"].notna()
         & prices["up_limit_price"].notna()
