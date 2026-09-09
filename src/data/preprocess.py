@@ -1,9 +1,23 @@
-"""预处理 Tushare 原始数据并构建 Notebook 01 的股票池。
+"""
+预处理 Tushare 原始数据并构建日频面板和月度股票池，结果统一写入 data/processed.
 
-本模块只读取 ``data/raw`` 中的原始数据，不调用 Tushare 接口。预处理结果统一写入
-``data/processed``。
+price_daily:
+    日频面板代表市场状态基础层，主要回答某只股票在某个交易日发生了什么，包含主键
+    （日期、股名）、OHLC、前收盘价、成交量、成交额、复权因子、市值、涨跌停价格
+    和一字涨跌停标记这些与市场交易最密切的字段，是一张比较稳定、泛用的市场基础表。
 
-原始数据的形式：？
+universe_monthly:
+    月度股票池关注的是在月末调仓日知道哪些信息，并得出股票是否可以进入研究样本和投资组合的结论。
+    它主要包含四类信息：调仓日当天的面板、股票的身份和上市退市信息、point-in-time 财务数据
+    （历史行业、报告期、公告日）和股票池筛选字段（is_st、is_suspended等）。
+
+构建思路：
+    日频面板以 daily 为基础表，然后按照 primary_key = ["ts_code", "trade_date"]
+    合并其它字段并去重。
+    月度股票池的主键仍然是 ["ts_code", "trade_date"]，但日期只保留每个月最后一个交易日，
+    所以需要先从日频面板中取得每个自然月最后一个开市交易日，然后再合并其它字段并去重。其中比较
+    复杂的是如何得到 point-in-time 财务数据。
+
 
 预处理数据的工作流：
 
@@ -29,11 +43,6 @@
 
 如需从原始数据开始执行完整预处理流程，可直接调用 ``run_preprocess_pipeline``；
 如只需检查或重跑某一步，则调用对应的单个函数。
-
-要点：
-- 时间要转换成时间戳timestamp
-- 利用 drop_duplicates 去重
-- 统一单位
 """
 
 # annotations 使类型注解主要用于静态类型检查和代码说明，而不会在函数定义时急于解析。
@@ -116,7 +125,8 @@ def read_date_partitions(directory: Path) -> pd.DataFrame:
 
 
 def select_sh_sz_stock_basic(stock_basic: pd.DataFrame) -> pd.DataFrame:
-    """从股票基础信息中选出沪深人民币股票。
+    """从股票基础信息中选出沪深人民币股票:
+    "exchange" in {"SSE", "SZSE"}, "curr_type"=="CNY"
 
     股票基础信息是预处理阶段的证券范围权威表。使用交易所和币种而不是仅根据
     代码后缀过滤，避免将非人民币证券误纳入研究范围。
@@ -135,12 +145,18 @@ def select_sh_sz_stock_basic(stock_basic: pd.DataFrame) -> pd.DataFrame:
 
     mask = stock_basic["exchange"].isin(SH_SZ_EXCHANGES)
     if "curr_type" in stock_basic.columns:
-        mask &= stock_basic["curr_type"].eq("CNY")
+        mask &= stock_basic["curr_type"]=="CNY"
+
     selected = stock_basic.loc[mask].copy()
     if selected.empty:
         raise ValueError("stock_basic 中没有可用的沪深人民币股票")
+
     # drop_duplicates 根据 ts_code 排除重复股票，每只股票只保留一行
-    return selected.drop_duplicates("ts_code", keep="last").sort_values("ts_code")
+    selected = selected.drop_duplicates("ts_code", keep="last")
+
+    selected = selected.sort_values("ts_code")
+
+    return selected
 
 
 def filter_stock_records(
@@ -179,13 +195,14 @@ def build_price_daily(
     原始文件保持不变。
     """
 
-    required = ("daily", "adj_factor", "daily_basic", "stk_limit")
+    required_columns = ("daily", "adj_factor", "daily_basic", "stk_limit")
+
     # 收集表格。frames: dict
-    frames = {name: read_date_partitions(raw_directory / name) for name in required}
+    frames = {name: read_date_partitions(raw_directory / name) for name in required_columns}
 
     ##### 错误报警
-    missing = [name for name, frame in frames.items() if frame.empty]
-    if missing:
+    missing_columns = [name for name, frame in frames.items() if frame.empty]
+    if missing_columns:
         raise FileNotFoundError(f"未找到以下接口的原始分区：{', '.join(missing)}")
     #####
 
@@ -203,10 +220,13 @@ def build_price_daily(
             raise ValueError("按股票代码白名单过滤后日线行情为空")
 
     # 以 daily 为基础合并其它表格
+
     prices = frames["daily"].copy()
+
     key = ["ts_code", "trade_date"]
+
     for name in ("adj_factor", "daily_basic", "stk_limit"):
-        # 注意去重的字段！每只股票每天保留一行
+        # 每只股票每天保留一行
         frame = frames[name].drop_duplicates(key)
         columns = [
             column
@@ -228,77 +248,119 @@ def build_price_daily(
             "down_limit": "down_limit_price",
         }
     )
+
     prices["date"] = _as_timestamp(prices["date"])
+
     prices["volume"] = prices["volume"] * 100.0
+
     prices["amount"] = prices["amount"] * 1_000.0
+
     prices["market_cap"] = prices["market_cap"] * 10_000.0
 
     status = prices.get(
         "limit_status", pd.Series(index=prices.index, dtype="float64")
     )
+
+    # 2：收盘涨停，但不是一字涨停。3：一字涨停
     prices["is_limit_up_close"] = status.isin([2, 3])
+
     prices["is_limit_down_close"] = status.isin([5, 6])
-    tolerance = 1e-8
+
     # 识别一字涨停股票，即全天最低成交价 ≥ 涨停价
     # 一字涨停股票的 is_buyable=False
-    prices["is_one_price_limit_up"] = (
+    tolerance = 1e-8
+    one_price_limit_up_mask = (
         prices["low"].notna()
         & prices["up_limit_price"].notna()
         & (prices["low"] >= prices["up_limit_price"] - tolerance)
     )
-    prices["is_one_price_limit_down"] = (
+
+    prices["is_one_price_limit_up"] = one_price_limit_up_mask
+
+    # 识别一字跌停股票
+    # 在个别不设涨跌幅限制或涨停价字段不适用的交易日，status==3 可能失效。
+    one_price_limit_down_mask = (
         prices["high"].notna()
         & prices["down_limit_price"].notna()
         & (prices["high"] <= prices["down_limit_price"] + tolerance)
     )
-    return prices.sort_values(["date", "stock_code"]).reset_index(drop=True)
+
+    prices["is_one_price_limit_down"] = one_price_limit_down_mask
+
+    prices = prices.sort_values(["date", "stock_code"])
+
+    prices = prices.reset_index(drop=True)
+
+    return prices
 
 
 def prepare_report_versions(
-    frame: pd.DataFrame,
+    frame: pd.DataFrame,            # 原始财报 DataFrame
     *,
-    value_columns: Iterable[str],
+    value_columns: Iterable[str],   # 这张财报必须包含的数值字段
 ) -> pd.DataFrame:
-    """清理一张财报表，同时保留同一报告期的历次公告版本。
+    """
+    清理一张财报表，输出仍然是一张 DataFrame，但：
+    - 将日期转成 Timestamp；
+    - 删除无效记录，提取需要的字段；
+    - 合并同一天的重复版本；
+    - 保留不同日期公布的修订版本。
 
     ``announcement_date`` 表示某个版本真正可用于研究的日期。这里只消除同一
     股票、报告期和公告日内的重复记录，不会跨公告日保留全样本最终修订版。
     """
 
-    value_columns = tuple(value_columns)
-    required_columns = {"ts_code", "ann_date", "end_date", *value_columns}
+    required_columns = {"ts_code", "ann_date", "end_date"} | set(value_columns)
+
     missing_columns = required_columns.difference(frame.columns)
     if missing_columns:
         raise ValueError(f"财报数据缺少必需字段：{sorted(missing_columns)}")
 
     reports = frame.copy()
+
+    # 财报报告期
     reports["end_date"] = _as_timestamp(reports["end_date"])
+
+    # 公告日期
     reports["ann_date"] = _as_timestamp(reports["ann_date"])
+
+    # 实际公告日期（不一定有）
     if "f_ann_date" in reports:
         reports["f_ann_date"] = _as_timestamp(reports["f_ann_date"])
     else:
+        # NaT 是 pandas 中日期类型的缺失值
         reports["f_ann_date"] = pd.NaT
-    reports["announcement_date"] = reports["f_ann_date"].fillna(
-        reports["ann_date"]
-    )
 
+    # 如果 f_ann_date 存在，使用 f_ann_date
+    # 否则使用 ann_date
+    reports["announcement_date"] = reports["f_ann_date"].fillna(reports["ann_date"])
+
+    # report_type 用于统一报表口径
+    # 很复杂，如有需要另查
     if "report_type" in reports:
         report_type = pd.to_numeric(reports["report_type"], errors="coerce")
-        reports = reports.loc[report_type.eq(1)].copy()
+        reports = reports.loc[report_type==1].copy()
+
     reports = reports.dropna(
         subset=["ts_code", "end_date", "announcement_date"]
     )
-    reports = reports.loc[
-        reports["end_date"].le(reports["announcement_date"])
-    ].copy()
+
+    valid_ann_date_mask = reports["end_date"]<=reports["announcement_date"]
+    reports = reports.loc[valid_ann_date_mask].copy()
 
     reports["_source_order"] = np.arange(len(reports))
+
+    # 临时字段用于解决一种边界情况：
+    # 同一股票、同一报告期、同一公告日、相同 update_flag 仍然有多条记录时，
+    # 代码最终会保留原始数据中靠后的那一条。
     if "update_flag" in reports:
         reports["_update_priority"] = pd.to_numeric(
             reports["update_flag"], errors="coerce"
         ).fillna(-1)
     else:
         reports["_update_priority"] = -1
+
+    # 排序层次依次是：股票代码；报告期；公告日期；更新优先级；原始行顺序
     reports = reports.sort_values(
         [
             "ts_code",
@@ -308,32 +370,44 @@ def prepare_report_versions(
             "_source_order",
         ]
     )
+
     reports = reports.drop_duplicates(
         ["ts_code", "end_date", "announcement_date"], keep="last"
     )
-    return (
-        reports.drop(columns=["_source_order", "_update_priority"])
-        .sort_values(["ts_code", "end_date", "announcement_date"])
-        .reset_index(drop=True)
-    )
+
+    reports = reports.drop(columns=["_source_order", "_update_priority"])
+
+    reports = reports.sort_values(["ts_code", "end_date", "announcement_date"])
+
+    reports = reports.reset_index(drop=True)
+
+    return reports
 
 
 def select_latest_report_versions_as_of(
     report_versions: pd.DataFrame,
-    as_of_date: pd.Timestamp,
+    as_of_date: pd.Timestamp,           # as of sometime: 截至某个时间
 ) -> pd.DataFrame:
-    """选择指定日期当时已经公告的各报告期最新版本。"""
+    """
+    选择 as of date 已经公告的各报告期最新版本，
+    也就是在这一天或之前已经公开的数据。
+    """
 
     as_of_date = pd.Timestamp(as_of_date)
-    available = report_versions.loc[
-        report_versions["announcement_date"].le(as_of_date)
-        & report_versions["end_date"].le(as_of_date)
-    ].copy()
-    return (
-        available.sort_values(["ts_code", "end_date", "announcement_date"])
-        .drop_duplicates(["ts_code", "end_date"], keep="last")
-        .reset_index(drop=True)
+
+    available_date_mask = (
+        (report_versions["announcement_date"] <= as_of_date)
+        & (report_versions["end_date"] <= as_of_date)
     )
+    available = report_versions.loc[available_date_mask].copy()
+
+    available = available.sort_values(["ts_code", "end_date", "announcement_date"])
+
+    available = available.drop_duplicates(["ts_code", "end_date"], keep="last")
+
+    available = available.reset_index(drop=True)
+
+    return available
 
 
 def _empty_financial_snapshot() -> pd.DataFrame:
@@ -355,6 +429,7 @@ def _empty_financial_snapshot() -> pd.DataFrame:
         "total_assets",
         "total_equity",
     ]
+
     return pd.DataFrame(columns=columns)
 
 
@@ -363,7 +438,7 @@ def _calculate_financial_snapshot_as_of(
     balance_as_of: pd.DataFrame,
     as_of_date: pd.Timestamp,
 ) -> pd.DataFrame:
-    """使用指定日期当时可见的报表版本计算一张横截面财务快照。"""
+    """使用 as of date 可见的报表版本计算一张横截面财务快照。"""
 
     if income_as_of.empty:
         return _empty_financial_snapshot()
