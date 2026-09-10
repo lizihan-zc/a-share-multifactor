@@ -203,7 +203,7 @@ def build_price_daily(
     ##### 错误报警
     missing_columns = [name for name, frame in frames.items() if frame.empty]
     if missing_columns:
-        raise FileNotFoundError(f"未找到以下接口的原始分区：{', '.join(missing)}")
+        raise FileNotFoundError(f"未找到以下接口的原始分区：{', '.join(missing_columns)}")
     #####
 
     if allowed_stock_codes is not None:
@@ -266,24 +266,17 @@ def build_price_daily(
 
     prices["is_limit_down_close"] = status.isin([5, 6])
 
-    # 识别一字涨停股票，即全天最低成交价 ≥ 涨停价
+    # 原则上识别一字涨停股票，应根据全天最低成交价 ≥ 涨停价；
+    # 但是某些不设涨跌幅限制或涨停价字段不适用的交易日，
+    # 也可能保留一个参考性的 up_limit_price，
+    # 所以不如直接用 Tushare 提供的 limit_status.
     # 一字涨停股票的 is_buyable=False
-    tolerance = 1e-8
-    one_price_limit_up_mask = (
-        prices["low"].notna()
-        & prices["up_limit_price"].notna()
-        & (prices["low"] >= prices["up_limit_price"] - tolerance)
-    )
+    one_price_limit_up_mask = status==3
 
     prices["is_one_price_limit_up"] = one_price_limit_up_mask
 
     # 识别一字跌停股票
-    # 在个别不设涨跌幅限制或涨停价字段不适用的交易日，status==3 可能失效。
-    one_price_limit_down_mask = (
-        prices["high"].notna()
-        & prices["down_limit_price"].notna()
-        & (prices["high"] <= prices["down_limit_price"] + tolerance)
-    )
+    one_price_limit_down_mask = status==6
 
     prices["is_one_price_limit_down"] = one_price_limit_down_mask
 

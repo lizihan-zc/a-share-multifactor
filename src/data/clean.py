@@ -1,6 +1,7 @@
 """清洗 Notebook 02 构造标签前使用的 processed 面板。
 
-推荐调用顺序及其对应的数据清洗工作流如下：
+思路：先把字段按结构要求、业务用途和清洗规则分组，在开头定义一些大写的模块级的配置常量；
+然后按顺序清洗对应的数据。
 
 1. 结构清洗：
    ``validate_required_columns`` → ``normalize_panel_keys`` →
@@ -23,10 +24,6 @@
 6. 质量报告：
    ``build_missing_rate_report`` → ``build_special_state_report``。汇总缺失率及特殊
    状态数量，为 Notebook 中的解释和图表提供可审计数据。
-
-通常直接调用 ``run_cleaning_workflow``；它会按以上顺序调用
-``clean_price_daily`` 和 ``clean_universe_monthly``，返回清洗后的副本及两张报告，
-不会覆盖 ``data/processed`` 中的原文件。
 """
 
 from __future__ import annotations
@@ -37,6 +34,7 @@ from typing import Iterable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+
 
 
 PANEL_KEY = ("date", "stock_code")
@@ -87,7 +85,11 @@ PRICE_COLUMNS = (
     "down_limit_price",
 )
 
-NON_NEGATIVE_COLUMNS = ("volume", "amount", "listing_trading_days")
+NON_NEGATIVE_COLUMNS = (
+    "volume",
+    "amount",
+    "listing_trading_days",
+)
 
 POSITIVE_COLUMNS = (
     *PRICE_COLUMNS,
@@ -151,6 +153,11 @@ class CleaningResult:
     special_state_report: pd.DataFrame
 
 
+'''
+============ 结构清洗 ============
+'''
+
+
 def validate_required_columns(
     frame: pd.DataFrame,
     required_columns: Iterable[str],
@@ -161,6 +168,7 @@ def validate_required_columns(
 
     if not isinstance(frame, pd.DataFrame):
         raise TypeError(f"{dataset_name} 必须是 pandas DataFrame")
+    
     missing = sorted(set(required_columns).difference(frame.columns))
     if missing:
         raise ValueError(f"{dataset_name} 缺少必需字段：{missing}")
@@ -174,19 +182,28 @@ def normalize_panel_keys(
     """统一股票代码和日期主键格式，并拒绝无法识别的空主键。"""
 
     validate_required_columns(frame, PANEL_KEY, dataset_name=dataset_name)
+
     cleaned = frame.copy()
-    cleaned["stock_code"] = (
-        cleaned["stock_code"].astype("string").str.strip().str.upper()
-    )
-    cleaned["date"] = pd.to_datetime(cleaned["date"], errors="coerce")
+
+    # 转换成 str, 删除空格，英文字母大写，并把缺失值保留为 <NA>
+    cleaned["stock_code"] = cleaned["stock_code"].astype("string")
+
+    cleaned["stock_code"] = cleaned["stock_code"].str.strip()
+
+    cleaned["stock_code"] = cleaned["stock_code"].str.upper()
 
     invalid_code = cleaned["stock_code"].isna() | cleaned["stock_code"].eq("")
+
+    cleaned["date"] = pd.to_datetime(cleaned["date"], errors="coerce")
+
     invalid_date = cleaned["date"].isna()
+
     if invalid_code.any() or invalid_date.any():
         raise ValueError(
             f"{dataset_name} 存在无效主键："
             f"股票代码 {int(invalid_code.sum())} 条，日期 {int(invalid_date.sum())} 条"
         )
+    
     return cleaned
 
 
@@ -195,10 +212,15 @@ def assert_unique_panel_keys(
     *,
     dataset_name: str,
 ) -> None:
-    """确认每个股票和日期组合只对应一条记录，避免连接后重复计算。"""
+    """
+    确认每个股票和日期组合只对应一条记录，避免连接后重复计算。
+    主键重复通常不是普通的脏数据，应该先查明原因，不能简单地去重。
+    """
 
     validate_required_columns(frame, PANEL_KEY, dataset_name=dataset_name)
+
     duplicated = frame.duplicated(list(PANEL_KEY), keep=False)
+
     if duplicated.any():
         examples = frame.loc[duplicated, list(PANEL_KEY)].head(5).to_dict("records")
         raise ValueError(
@@ -207,17 +229,9 @@ def assert_unique_panel_keys(
         )
 
 
-def normalize_datetime_columns(
-    frame: pd.DataFrame,
-    columns: Iterable[str],
-) -> pd.DataFrame:
-    """把存在的辅助日期字段统一转为 pandas 时间戳，非法文本转为缺失。"""
-
-    cleaned = frame.copy()
-    for column in columns:
-        if column in cleaned.columns:
-            cleaned[column] = pd.to_datetime(cleaned[column], errors="coerce")
-    return cleaned
+'''
+============ 数值清洗 ============
+'''
 
 
 def clean_numeric_values(
@@ -227,27 +241,35 @@ def clean_numeric_values(
     positive_columns: Iterable[str] = (),
     non_negative_columns: Iterable[str] = (),
 ) -> pd.DataFrame:
-    """规范数值字段，并把无穷值及违反经济取值范围的数值设为缺失。"""
+    """规范数值字段，并把无穷值和符号错误的数值设为缺失。"""
 
     cleaned = frame.copy()
-    existing_numeric = [column for column in numeric_columns if column in cleaned]
-    for column in existing_numeric:
-        cleaned[column] = pd.to_numeric(cleaned[column], errors="coerce").replace(
-            [np.inf, -np.inf], np.nan
-        )
+
+    existing_numeric_columns = [column for column in numeric_columns if column in cleaned]
+
+    for column in existing_numeric_columns:
+        cleaned[column] = pd.to_numeric(cleaned[column], errors="coerce")
+        cleaned[column] = cleaned[column].replace([np.inf, -np.inf], np.nan)
 
     for column in positive_columns:
         if column in cleaned:
-            cleaned.loc[cleaned[column].notna() & cleaned[column].le(0), column] = np.nan
+            non_positive_mask = (
+                cleaned[column].notna() & (cleaned[column]<=0)
+            )
+            cleaned.loc[non_positive_mask, column] = np.nan
 
     for column in non_negative_columns:
         if column in cleaned:
-            cleaned.loc[cleaned[column].notna() & cleaned[column].lt(0), column] = np.nan
+            negative_mask = (
+                cleaned[column].notna() & (cleaned[column]<0)
+            )
+            cleaned.loc[negative_mask, column] = np.nan
+
     return cleaned
 
 
 def add_price_quality_flags(frame: pd.DataFrame) -> pd.DataFrame:
-    """根据 OHLC、成交数据、复权因子和市值生成价格质量诊断字段。"""
+    """检查 OHLC、成交数据、复权因子和市值的缺失值和符号，生成合法性检查字段。"""
 
     validate_required_columns(
         frame,
@@ -264,64 +286,65 @@ def add_price_quality_flags(frame: pd.DataFrame) -> pd.DataFrame:
         },
         dataset_name="价格面板",
     )
+
     cleaned = frame.copy()
 
+    # 判断每一行是否数据齐全
+    # axis=1 每一行计算一次，得到“每行一个结果”
+    # axis=0 每一列计算一次，得到“每列一个结果”
     ohlc_complete = cleaned[["open", "high", "low", "close"]].notna().all(axis=1)
-    ohlc_ordered = (
-        cleaned["high"].ge(cleaned[["open", "low", "close"]].max(axis=1))
-        & cleaned["low"].le(cleaned[["open", "high", "close"]].min(axis=1))
-    )
+    
+    valid_high = cleaned["high"] >= cleaned[["open", "low", "close"]].max(axis=1)
+    valid_low = cleaned["low"] <= cleaned[["open", "high", "close"]].min(axis=1)
+    ohlc_ordered = valid_high & valid_low
+
     cleaned["has_valid_ohlc"] = ohlc_complete & ohlc_ordered
+
+    valid_close = (
+        cleaned["close"].notna() & (cleaned["close"]>0)
+    )
+    valid_adj_factor = (
+        cleaned["adj_factor"].notna() & (cleaned["adj_factor"]>0)
+    )
     cleaned["has_valid_label_price"] = (
-        cleaned["close"].notna()
-        & cleaned["adj_factor"].notna()
-        & cleaned["close"].gt(0)
-        & cleaned["adj_factor"].gt(0)
+        valid_close & valid_adj_factor
     )
-    cleaned["has_valid_trading_value"] = (
-        cleaned[["volume", "amount"]].notna().all(axis=1)
-        & cleaned["volume"].ge(0)
-        & cleaned["amount"].ge(0)
-    )
-    cleaned["has_valid_market_cap"] = (
-        cleaned["market_cap"].notna() & cleaned["market_cap"].gt(0)
-    )
+
     cleaned["adjusted_close"] = cleaned["close"] * cleaned["adj_factor"]
+
+    volume_amount_complete = cleaned[["volume", "amount"]].notna().all(axis=1)
+    cleaned["has_valid_trading_value"] = (
+        volume_amount_complete
+        & (cleaned["volume"]>=0)
+        & (cleaned["amount"]>=0)
+    )
+
+    cleaned["has_valid_market_cap"] = (
+        cleaned["market_cap"].notna() & (cleaned["market_cap"]>0)
+    )
+
     return cleaned
 
 
-def add_return_diagnostics(
-    price_daily: pd.DataFrame,
-    *,
-    extreme_return_threshold: float = 0.20,
-) -> pd.DataFrame:
-    """计算逐股相邻行情收益和日期间隔，仅标记极端或不可能的收益。"""
+'''
+============ 时间对齐 ============
+'''
 
-    if extreme_return_threshold <= 0:
-        raise ValueError("extreme_return_threshold 必须为正数")
-    validate_required_columns(
-        price_daily,
-        {"stock_code", "date", "adjusted_close"},
-        dataset_name="price_daily",
-    )
-    cleaned = price_daily.sort_values(list(PANEL_KEY)).reset_index(drop=True).copy()
-    grouped = cleaned.groupby("stock_code", sort=False)
-    cleaned["previous_observation_date"] = grouped["date"].shift(1)
-    previous_adjusted_close = grouped["adjusted_close"].shift(1)
-    cleaned["observation_gap_days"] = (
-        cleaned["date"] - cleaned["previous_observation_date"]
-    ).dt.days
-    cleaned["adjacent_adjusted_return"] = (
-        cleaned["adjusted_close"] / previous_adjusted_close - 1.0
-    )
-    finite_return = np.isfinite(cleaned["adjacent_adjusted_return"])
-    cleaned["has_impossible_adjacent_return"] = (
-        finite_return & cleaned["adjacent_adjusted_return"].lt(-1.0)
-    )
-    cleaned["is_extreme_adjacent_return"] = (
-        finite_return
-        & cleaned["adjacent_adjusted_return"].abs().ge(extreme_return_threshold)
-    )
+
+def normalize_datetime_columns(
+    frame: pd.DataFrame,
+    columns: Iterable[str],     # MONTHLY_DATE_COLUMNS, 主要包含月度表中的辅助日期字段
+) -> pd.DataFrame:
+    """
+    把主键以外的其它日期字段统一转为时间戳，非法文本转为缺失。
+    """
+
+    cleaned = frame.copy()
+
+    for column in columns:
+        if column in cleaned.columns:
+            cleaned[column] = pd.to_datetime(cleaned[column], errors="coerce")
+
     return cleaned
 
 
@@ -333,14 +356,19 @@ def add_point_in_time_flags(universe_monthly: pd.DataFrame) -> pd.DataFrame:
         {"date", "financial_available_date"},
         dataset_name="universe_monthly",
     )
+
     cleaned = universe_monthly.copy()
-    cleaned["has_future_financial_data"] = cleaned[
-        "financial_available_date"
-    ].gt(cleaned["date"])
+
+    # 检查是否存在未来财报
+    cleaned["has_future_financial_data"] = (
+        cleaned["financial_available_date"] > cleaned["date"]
+    )
+    
     cleaned["has_point_in_time_financials"] = (
         cleaned["financial_available_date"].notna()
-        & ~cleaned["has_future_financial_data"]
+        & ~cleaned["has_future_financial_data"]     # 没有未来财报
     )
+
     return cleaned
 
 
@@ -356,17 +384,87 @@ def validate_point_in_time_financials(universe_monthly: pd.DataFrame) -> None:
         },
         dataset_name="universe_monthly",
     )
+
     future_count = int(universe_monthly["has_future_financial_data"].sum())
+
     missing_date = (
         universe_monthly["has_core_data"].fillna(False)
         & universe_monthly["financial_available_date"].isna()
     )
+
     if future_count or missing_date.any():
         raise ValueError(
             "universe_monthly 的财务时点不合法："
             f"未来财务 {future_count} 条，"
             f"核心财务完整但可用日期缺失 {int(missing_date.sum())} 条"
         )
+
+
+def validate_monthly_rebalance_dates(
+    universe_monthly: pd.DataFrame,
+    price_daily: pd.DataFrame,
+) -> None:
+    """
+    确认每月只有一个调仓日，且该日等于日频面板中的当月最后交易日。
+    月度股票池中每个月有很多股票，每个股票有一个 date，
+    确保每个月只有唯一的调仓日，需要按月分组（于是需要将日期转换成月）。
+    """
+
+    validate_required_columns(
+        universe_monthly, {"date"}, dataset_name="universe_monthly"
+    )
+
+    validate_required_columns(
+        price_daily, {"date"}, dataset_name="price_daily"
+    )
+
+    # .unique() 返回非重复元素的一个没有索引的数组
+    # 它与 .duplicated() 的区别是后者返回的是bool值
+    monthly_dates = universe_monthly["date"].dropna().unique()
+
+    monthly_dates = pd.DatetimeIndex(monthly_dates).sort_values()
+
+    # 构造一个月度股票池中所有日期的 DataFrame
+    monthly_table = pd.DataFrame({"date": monthly_dates})
+
+    # 将日期转换为月份
+    monthly_table["period"] = monthly_table["date"].dt.to_period("M")
+
+    # 检查每个月是否有多个调仓日
+    # .nunique() 返回不同元素的个数
+    repeated_dates = monthly_table.groupby("period")["date"].nunique()
+
+    repeated_months = repeated_dates>1
+
+    # .any() 一旦有 True 则返回 True
+    if repeated_months.any():
+        periods = repeated_months.index[repeated_months].astype(str).tolist()
+        raise ValueError(f"universe_monthly 同一自然月存在多个调仓日：{periods[:5]}")
+
+    daily_dates = price_daily["date"].dropna().unique()
+
+    daily_dates = pd.DataFrame({"date": daily_dates})
+
+    daily_dates["period"] = daily_dates["date"].dt.to_period("M")
+
+    expected_month_end = daily_dates.groupby("period")["date"].max()
+
+    expected_month_end = expected_month_end.to_dict()
+
+    mismatches = [
+        date
+        for date in monthly_dates
+        if expected_month_end.get(date.to_period("M")) != date
+    ]
+
+    if mismatches:
+        examples = [pd.Timestamp(date).strftime("%Y-%m-%d") for date in mismatches[:5]]
+        raise ValueError(f"月度调仓日不是日频面板中的当月最后交易日：{examples}")
+
+
+'''
+============ 特殊状态处理 ============
+'''
 
 
 def add_universe_quality_flags(universe_monthly: pd.DataFrame) -> pd.DataFrame:
@@ -383,6 +481,7 @@ def add_universe_quality_flags(universe_monthly: pd.DataFrame) -> pd.DataFrame:
         },
         dataset_name="universe_monthly",
     )
+
     cleaned = universe_monthly.copy()
 
     expected_eligible = (
@@ -394,15 +493,19 @@ def add_universe_quality_flags(universe_monthly: pd.DataFrame) -> pd.DataFrame:
         & cleaned["passes_liquidity"].fillna(False)
         & cleaned["has_core_data"].fillna(False)
     )
+
     cleaned["eligibility_rule_inconsistent"] = (
         cleaned["is_eligible"].fillna(False) != expected_eligible
     )
+
     cleaned["has_invalid_label_price"] = ~cleaned["has_valid_label_price"]
+
     cleaned["is_entry_blocked"] = (
         cleaned["is_suspended"].fillna(False)
         | cleaned["is_one_price_limit_up"].fillna(False)
         | ~cleaned["is_buyable"].fillna(False)
     )
+
     cleaned["has_special_state"] = (
         cleaned["is_st"].fillna(False)
         | cleaned["is_suspended"].fillna(False)
@@ -412,45 +515,15 @@ def add_universe_quality_flags(universe_monthly: pd.DataFrame) -> pd.DataFrame:
         | cleaned["has_future_financial_data"]
         | cleaned["eligibility_rule_inconsistent"]
     )
+
     cleaned["is_clean_for_label"] = (
         cleaned["is_eligible"].fillna(False)
         & cleaned["has_valid_label_price"]
         & ~cleaned["has_future_financial_data"]
         & ~cleaned["eligibility_rule_inconsistent"]
     )
+
     return cleaned
-
-
-def validate_monthly_rebalance_dates(
-    universe_monthly: pd.DataFrame,
-    price_daily: pd.DataFrame,
-) -> None:
-    """确认每月只有一个调仓日，且该日等于日频面板中的当月最后交易日。"""
-
-    validate_required_columns(
-        universe_monthly, {"date"}, dataset_name="universe_monthly"
-    )
-    validate_required_columns(price_daily, {"date"}, dataset_name="price_daily")
-
-    monthly_dates = pd.DatetimeIndex(universe_monthly["date"].dropna().unique()).sort_values()
-    monthly_table = pd.DataFrame({"date": monthly_dates})
-    monthly_table["period"] = monthly_table["date"].dt.to_period("M")
-    repeated_months = monthly_table.groupby("period")["date"].nunique().gt(1)
-    if repeated_months.any():
-        periods = repeated_months.index[repeated_months].astype(str).tolist()
-        raise ValueError(f"universe_monthly 同一自然月存在多个调仓日：{periods[:5]}")
-
-    daily_dates = pd.DataFrame({"date": price_daily["date"].dropna().unique()})
-    daily_dates["period"] = daily_dates["date"].dt.to_period("M")
-    expected_month_end = daily_dates.groupby("period")["date"].max().to_dict()
-    mismatches = [
-        date
-        for date in monthly_dates
-        if expected_month_end.get(date.to_period("M")) != date
-    ]
-    if mismatches:
-        examples = [pd.Timestamp(date).strftime("%Y-%m-%d") for date in mismatches[:5]]
-        raise ValueError(f"月度调仓日不是日频面板中的当月最后交易日：{examples}")
 
 
 def load_month_end_suspensions(
@@ -463,16 +536,20 @@ def load_month_end_suspensions(
     if not directory.is_dir():
         raise FileNotFoundError(f"停牌数据目录不存在：{directory}")
 
-    dates = pd.DatetimeIndex(
+    dates = (
         pd.to_datetime(pd.Series(list(rebalance_dates)), errors="coerce")
         .dropna()
         .unique()
-    ).sort_values()
+    )
+    dates = pd.DatetimeIndex(dates).sort_values()
+
     if dates.empty:
         raise ValueError("rebalance_dates 中没有有效调仓日")
 
     suspension_frames = []
+
     coverage_records = []
+    
     for date in dates:
         path = directory / f"trade_date={pd.Timestamp(date):%Y%m%d}.parquet"
         partition_available = path.is_file()
@@ -532,6 +609,51 @@ def load_month_end_suspensions(
     return suspensions, coverage
 
 
+'''
+============ 异常收益诊断 ============
+'''
+
+
+def add_return_diagnostics(
+    price_daily: pd.DataFrame,
+    *,
+    extreme_return_threshold: float = 0.20,
+) -> pd.DataFrame:
+    """计算逐股相邻行情收益和日期间隔，仅标记极端或不可能的收益。"""
+
+    if extreme_return_threshold <= 0:
+        raise ValueError("extreme_return_threshold 必须为正数")
+    validate_required_columns(
+        price_daily,
+        {"stock_code", "date", "adjusted_close"},
+        dataset_name="price_daily",
+    )
+    cleaned = price_daily.sort_values(list(PANEL_KEY)).reset_index(drop=True).copy()
+    grouped = cleaned.groupby("stock_code", sort=False)
+    cleaned["previous_observation_date"] = grouped["date"].shift(1)
+    previous_adjusted_close = grouped["adjusted_close"].shift(1)
+    cleaned["observation_gap_days"] = (
+        cleaned["date"] - cleaned["previous_observation_date"]
+    ).dt.days
+    cleaned["adjacent_adjusted_return"] = (
+        cleaned["adjusted_close"] / previous_adjusted_close - 1.0
+    )
+    finite_return = np.isfinite(cleaned["adjacent_adjusted_return"])
+    cleaned["has_impossible_adjacent_return"] = (
+        finite_return & cleaned["adjacent_adjusted_return"].lt(-1.0)
+    )
+    cleaned["is_extreme_adjacent_return"] = (
+        finite_return
+        & cleaned["adjacent_adjusted_return"].abs().ge(extreme_return_threshold)
+    )
+    return cleaned
+
+
+'''
+============ 质量报告 ============
+'''
+
+
 def build_missing_rate_report(
     datasets: Mapping[str, pd.DataFrame],
     *,
@@ -584,6 +706,11 @@ def build_special_state_report(universe_monthly: pd.DataFrame) -> pd.DataFrame:
             }
         )
     return pd.DataFrame.from_records(records)
+
+
+'''
+============ 工作流构建 ============
+'''
 
 
 def clean_price_daily(
