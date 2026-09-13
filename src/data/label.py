@@ -91,6 +91,7 @@ def validate_cleaned_universe(cleaned_universe_monthly: pd.DataFrame) -> None:
         CLEANED_UNIVERSE_REQUIRED_COLUMNS,
         dataset_name="cleaned_universe_monthly",
     )
+
     assert_unique_panel_keys(
         cleaned_universe_monthly, dataset_name="cleaned_universe_monthly"
     )
@@ -144,37 +145,47 @@ def validate_month_end_suspension_data(
 def build_next_rebalance_date_map(
     cleaned_universe_monthly: pd.DataFrame,
 ) -> Dict[pd.Timestamp, pd.Timestamp]:
-    """根据月度面板的 date 唯一值建立当前调仓日到下一调仓日的映射。"""
+    """
+    建立当前调仓日到下一调仓日的映射。
+    月度股票池中每个月应该有唯一的 date.
+    """
 
     validate_required_columns(
         cleaned_universe_monthly,
         {"date"},
         dataset_name="cleaned_universe_monthly",
     )
-    dates = pd.DatetimeIndex(
-        pd.to_datetime(cleaned_universe_monthly["date"], errors="coerce")
+
+    dates = (cleaned_universe_monthly["date"]
         .dropna()
-        .unique()
-    ).sort_values()
+        .drop_duplicates()
+        .sort_values()
+        .reset_index(drop=True)
+    )
     if dates.empty:
         raise ValueError("cleaned_universe_monthly 中没有有效调仓日")
 
     # 每个自然月只能对应一个正式调仓日，否则“未来一个月”没有唯一含义。
-    periods = pd.Series(dates.to_period("M"))
+    periods = dates.dt.to_period("M")
     if periods.duplicated().any():
         repeated = periods.loc[periods.duplicated(keep=False)].astype(str).unique()
         raise ValueError(f"同一自然月存在多个调仓日：{repeated[:5].tolist()}")
 
-    return {
-        pd.Timestamp(dates[index]): pd.Timestamp(dates[index + 1])
-        for index in range(len(dates) - 1)
+    next_rebalance_date = {
+        dates.iloc[i]: dates.iloc[i + 1]
+        for i in range(len(dates) - 1)
     }
+
+    return next_rebalance_date
 
 
 def build_label_endpoint_table(
     cleaned_universe_monthly: pd.DataFrame,
 ) -> pd.DataFrame:
-    """提取并重命名下一调仓日的价格、停牌和一字跌停审计字段。"""
+    """
+    从清洗后的月度股票池中选取标签终点需要的字段，复制成一张“终点候选表”，
+    并把字段改成带 _t1 的名称。
+    """
 
     validate_required_columns(
         cleaned_universe_monthly,
@@ -190,6 +201,7 @@ def build_label_endpoint_table(
         },
         dataset_name="cleaned_universe_monthly",
     )
+
     endpoints = cleaned_universe_monthly[
         [
             "date",
@@ -202,8 +214,10 @@ def build_label_endpoint_table(
             "is_one_price_limit_down",
         ]
     ].copy()
+
     endpoints["has_exit_record"] = True
-    return endpoints.rename(
+
+    endpoints.rename(
         columns={
             "date": "label_end_date",
             "close": "close_t1",
@@ -215,58 +229,75 @@ def build_label_endpoint_table(
         }
     )
 
+    return endpoints
+
 
 def attach_exit_suspension_status(
     panel: pd.DataFrame,
     month_end_suspensions: pd.DataFrame,
     suspension_date_coverage: pd.DataFrame,
 ) -> pd.DataFrame:
-    """把原始月末停牌记录和分区覆盖状态连接到标签终点。"""
+    """
+    把原始月末停牌记录和分区覆盖状态连接到标签终点。
+    分区覆盖状态是一个数据完整性审计字段，防止把
+    “没有下载到当天停牌数据”误判成“股票没有停牌”。
+    """
 
     validate_month_end_suspension_data(
         month_end_suspensions, suspension_date_coverage
     )
+
     enriched = panel.copy()
+
     suspension_endpoints = month_end_suspensions[
         ["date", "stock_code", "is_suspended"]
-    ].rename(
+    ]
+    suspension_endpoints.rename(
         columns={
             "date": "label_end_date",
             "is_suspended": "has_suspension_record_t1",
         }
     )
+
     coverage_endpoints = suspension_date_coverage[
         ["date", "suspension_data_available"]
-    ].rename(
+    ]
+    coverage_endpoints.rename(
         columns={
             "date": "label_end_date",
             "suspension_data_available": "suspension_data_available_t1",
         }
     )
+
     enriched = enriched.merge(
         suspension_endpoints,
         on=["label_end_date", "stock_code"],
         how="left",
         validate="many_to_one",
     )
+
     enriched = enriched.merge(
         coverage_endpoints,
         on="label_end_date",
         how="left",
         validate="many_to_one",
     )
+
     enriched["has_suspension_record_t1"] = _fill_boolean_missing_with_false(
         enriched["has_suspension_record_t1"]
     )
+
     enriched["suspension_data_available_t1"] = _fill_boolean_missing_with_false(
         enriched["suspension_data_available_t1"]
     )
+
     enriched["is_suspended_t1"] = (
         _fill_boolean_missing_with_false(
             enriched["is_suspended_t1_from_universe"]
         )
         | enriched["has_suspension_record_t1"]
     )
+    
     return enriched
 
 

@@ -12,9 +12,8 @@ universe_monthly:
     （历史行业、报告期、公告日）和股票池筛选字段（is_st、is_suspended等）。
 
 构建思路：
-    日频面板以 daily 为基础表，然后按照 primary_key = ["ts_code", "trade_date"]
-    合并其它字段并去重。
-    月度股票池的主键仍然是 ["ts_code", "trade_date"]，但日期只保留每个月最后一个交易日，
+    日频面板以 daily 为基础表，然后按照主键 ["ts_code", "trade_date"]合并其它字段并去重。
+    月度股票池的主键仍然是 ["ts_code", "trade_date"]，但日期只保留每个月的最后一个交易日，
     所以需要先从日频面板中取得每个自然月最后一个开市交易日，然后再合并其它字段并去重。其中比较
     复杂的是如何得到 point-in-time 财务数据。
 
