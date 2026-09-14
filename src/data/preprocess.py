@@ -2,43 +2,47 @@
 预处理 Tushare 原始数据并构建日频面板和月度股票池，结果统一写入 data/processed.
 
 price_daily:
-    日频面板代表市场状态基础层，主要回答某只股票在某个交易日发生了什么，包含主键
-    （日期、股名）、OHLC、前收盘价、成交量、成交额、复权因子、市值、涨跌停价格
-    和一字涨跌停标记这些与市场交易最密切的字段，是一张比较稳定、泛用的市场基础表。
+    日频面板是实际行情记录的事实层，主要回答某只股票在有行情的交易日发生了什么。
+    它包含主键（日期、股票代码）、OHLC、前收盘价、成交量、成交额、复权因子、
+    市值、涨跌停价格和一字涨跌停标记。全天停牌等没有日线行情的股票不一定有记录。
 
 universe_monthly:
-    月度股票池关注的是在月末调仓日知道哪些信息，并得出股票是否可以进入研究样本和投资组合的结论。
-    它主要包含四类信息：调仓日当天的面板、股票的身份和上市退市信息、point-in-time 财务数据
-    （历史行业、报告期、公告日）和股票池筛选字段（is_st、is_suspended等）。
+    月度股票池关注月末调仓日当时已知的信息，以及股票是否可以进入研究样本和
+    投资组合。它以调仓日和上市区间内股票的完整骨架为基础，包含月末行情、股票
+    身份和上市退市信息、ST 与停牌状态、历史行业、point-in-time 财务数据及股票池
+    筛选字段。没有月末行情的股票仍保留，并通过 ``has_price_record`` 标记。
 
 构建思路：
-    日频面板以 daily 为基础表，然后按照主键 ["ts_code", "trade_date"]合并其它字段并去重。
-    月度股票池的主键仍然是 ["ts_code", "trade_date"]，但日期只保留每个月的最后一个交易日，
-    所以需要先从日频面板中取得每个自然月最后一个开市交易日，然后再合并其它字段并去重。其中比较
-    复杂的是如何得到 point-in-time 财务数据。
+    日频面板以 ``daily`` 为基础表，按 ``["ts_code", "trade_date"]`` 左连接
+    ``adj_factor``、``daily_basic`` 和 ``stk_limit``。
 
+    月度股票池骨架先从交易日历取得每个自然月最后一个开市日，再与股票基础信息做直积，
+    并按 ``list_date`` 和 ``delist_date`` 保留理论上市记录。随后按 
+    ``["date", "stock_code"]`` 左连接月末行情、ST、停牌、point-in-time 财务快照和
+    历史行业，最后计算数据可用性、可交易性及``is_eligible``。
 
 预处理数据的工作流：
 
-1. 确定沪深股票范围：调用 ``select_sh_sz_stock_basic`` 从股票基础信息中保留
-   上交所和深交所的人民币股票，并生成股票代码白名单。
-2. 读取并过滤原始数据：调用 ``read_date_partitions`` 读取日线、复权因子、每日
-   指标、涨跌停、ST 和停牌数据；调用 ``filter_stock_records`` 只保留白名单中的
-   沪深股票，不改动 ``data/raw`` 原始文件。
-3. 构建日频面板：调用 ``build_price_daily`` 合并行情相关接口，并统一成交量、
-   成交额和市值单位。
-4. 构建月末财务快照：调用 ``prepare_report_versions`` 保留同一报告期的历次公告
-   和修订版本；调用 ``build_monthly_financial_snapshots`` 在每个调仓日先选择当时
-   已公告的最新版本，再计算 TTM 指标并合并同报告期资产负债表，避免未来修订值
-   泄漏到历史。
-5. 匹配历史行业：调用 ``attach_historical_industry``，使用 ``in_date`` 和
-   ``out_date`` 确定每个调仓日的申万一级行业。
-6. 构建月度股票池：调用 ``build_monthly_universe``，处理上市状态、上市交易日数、
-   ST、停牌、涨停可买性、流动性和核心字段完整性；同时输出
-   ``has_gp_factor_data``，供后续毛利润质量因子按自身数据可得性筛选样本，银行和
-   非银金融不会仅因不适用普通毛利润口径而被剔除出全局股票池。
+1. 确定证券和日期范围：读取交易日历；调用 ``select_sh_sz_stock_basic`` 从股票
+   基础信息中保留上交所、深交所的人民币股票，并生成股票代码白名单。
+2. 构建日频行情事实表：调用 ``build_price_daily``；该函数通过
+   ``read_date_partitions`` 读取 ``daily``、``adj_factor``、``daily_basic`` 和
+   ``stk_limit``，使用 ``stock_filter`` 过滤白名单股票，按股票和交易日左连接各表，
+   并统一成交量、成交额和市值单位。
+3. 确定正式调仓日：调用 ``_monthly_rebalance_dates`` 从交易日历取得每个自然月
+   最后一个开市日，再限制到研究起止区间。
+4. 准备辅助数据：财务报表、历史行业数据、ST和停牌；调用 ``stock_filter`` 统一保留白名单股票。
+5. 构建 point-in-time 财务快照：调用 ``build_monthly_financial_snapshots``。该函数先用
+   ``_prepare_report_versions`` 整理公告与修订版本，再通过
+   ``_select_latest_report_versions_as_of`` 和 ``_calculate_financial_snapshot_as_of``
+   为每个调仓日选取当时已公告的最新版本、计算 TTM，并合并同报告期资产负债表，避免未来信息泄漏。
+6. 构建月度股票池：调用 ``build_monthly_universe``，先建立“调仓日 × 股票”的
+   骨架并按上市区间筛选，再左连接月末行情、ST、停牌和财务快照；
+   调用``attach_historical_industry`` 按 ``in_date``、``out_date`` 匹配历史行业；
+   最后计算 ``has_price_record``、上市交易日数、可买性、流动性、核心字段完整性、
+   ``has_gp_factor_data`` 和 ``is_eligible``。
 7. 保存结果：调用 ``save_notebook01_outputs``，将 ``price_daily.parquet`` 和
-   ``universe_monthly.parquet`` 写入 ``data/processed``。
+   ``universe_monthly.parquet`` 原子写入 ``data/processed``。
 
 如需从原始数据开始执行完整预处理流程，可直接调用 ``run_preprocess_pipeline``；
 如只需检查或重跑某一步，则调用对应的单个函数。
@@ -142,43 +146,50 @@ def select_sh_sz_stock_basic(stock_basic: pd.DataFrame) -> pd.DataFrame:
         )
     #####
 
-    mask = stock_basic["exchange"].isin(SH_SZ_EXCHANGES)
+    sh_sz_mask = stock_basic["exchange"].isin(SH_SZ_EXCHANGES)
     if "curr_type" in stock_basic.columns:
-        mask &= stock_basic["curr_type"]=="CNY"
+        sh_sz_mask &= stock_basic["curr_type"]=="CNY"
 
-    selected = stock_basic.loc[mask].copy()
+    selected = stock_basic.loc[sh_sz_mask].copy()
     if selected.empty:
         raise ValueError("stock_basic 中没有可用的沪深人民币股票")
 
-    # drop_duplicates 根据 ts_code 排除重复股票，每只股票只保留一行
-    selected = selected.drop_duplicates("ts_code", keep="last")
-
-    selected = selected.sort_values("ts_code")
+    selected = (
+        selected.drop_duplicates("ts_code", keep="last")
+        .sort_values("ts_code")
+    )
 
     return selected
 
 
-def filter_stock_records(
+def stock_filter(
     frame: pd.DataFrame,
     allowed_stock_codes: Iterable[str],
     *,
+    # code_column 表示 frame 中哪一列存放股票代码
+    # Tushare 原始数据通常用 ts_code 表示股票代码
     code_column: str = "ts_code",
 ) -> pd.DataFrame:
-    """按股票代码白名单过滤一张原始或中间表。
-
+    """
+    按股票代码过滤 .parquet 文件。（重要！）
+    即从 frame 中选出 code=allowed_stock_codes 的行。
     空表会保持原有字段直接返回；非空表必须包含指定的代码字段。该函数只返回
     过滤后的副本，不会修改 data/raw 中的任何文件。
     """
 
     if frame.empty:
         return frame.copy()
+    
     if code_column not in frame.columns:
         raise ValueError(f"数据缺少股票代码字段：{code_column}")
 
     allowed = {str(code) for code in allowed_stock_codes if pd.notna(code)}
     if not allowed:
         raise ValueError("股票代码白名单不能为空")
-    return frame.loc[frame[code_column].astype("string").isin(allowed)].copy()
+
+    mask = frame[code_column].astype("string").isin(allowed)
+    
+    return frame.loc[mask].copy()
 
 
 def build_price_daily(
@@ -212,7 +223,7 @@ def build_price_daily(
         if not allowed:
             raise ValueError("股票代码白名单不能为空")
         frames = {
-            name: filter_stock_records(frame, allowed)
+            name: stock_filter(frame, allowed)
             for name, frame in frames.items()
         }
         if frames["daily"].empty:
@@ -286,17 +297,34 @@ def build_price_daily(
     return prices
 
 
-def prepare_report_versions(
-    frame: pd.DataFrame,            # 原始财报 DataFrame
+# 按照pipeline中函数出现的顺序重新组织一下！
+
+
+def _monthly_rebalance_dates(calendar: pd.DataFrame) -> pd.DataFrame:
+    """返回每个自然月最后一个开市交易日，也就是调仓日。"""
+
+    dates = (
+        _as_timestamp(calendar["cal_date"])
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+    )
+    month_end = dates.groupby(dates.dt.to_period("M")).max()
+    return pd.DataFrame({"date": month_end.to_numpy()})
+
+
+def _prepare_report_versions(
+    frame: pd.DataFrame,            # 原始财报
     *,
     value_columns: Iterable[str],   # 这张财报必须包含的数值字段
 ) -> pd.DataFrame:
     """
-    清理一张财报表，输出仍然是一张 DataFrame，但：
+    从 income 和 balancesheet 中提取需要的字段，同时：
     - 将日期转成 Timestamp；
-    - 删除无效记录，提取需要的字段；
     - 合并同一天的重复版本；
     - 保留不同日期公布的修订版本。
+
+    实现: reports = reports.loc[valid_ann_date_mask].copy()
 
     ``announcement_date`` 表示某个版本真正可用于研究的日期。这里只消除同一
     股票、报告期和公告日内的重复记录，不会跨公告日保留全样本最终修订版。
@@ -353,30 +381,26 @@ def prepare_report_versions(
         reports["_update_priority"] = -1
 
     # 排序层次依次是：股票代码；报告期；公告日期；更新优先级；原始行顺序
-    reports = reports.sort_values(
-        [
-            "ts_code",
-            "end_date",
-            "announcement_date",
-            "_update_priority",
-            "_source_order",
-        ]
+    reports = (
+        reports.sort_values(
+            [
+                "ts_code",
+                "end_date",
+                "announcement_date",
+                "_update_priority",
+                "_source_order",
+            ]
+        )
+        .drop_duplicates(["ts_code", "end_date", "announcement_date"], keep="last")
+        .drop(columns=["_source_order", "_update_priority"])
+        .sort_values(["ts_code", "end_date", "announcement_date"])
+        .reset_index(drop=True)
     )
-
-    reports = reports.drop_duplicates(
-        ["ts_code", "end_date", "announcement_date"], keep="last"
-    )
-
-    reports = reports.drop(columns=["_source_order", "_update_priority"])
-
-    reports = reports.sort_values(["ts_code", "end_date", "announcement_date"])
-
-    reports = reports.reset_index(drop=True)
 
     return reports
 
 
-def select_latest_report_versions_as_of(
+def _select_latest_report_versions_as_of(
     report_versions: pd.DataFrame,
     as_of_date: pd.Timestamp,           # as of sometime: 截至某个时间
 ) -> pd.DataFrame:
@@ -391,22 +415,24 @@ def select_latest_report_versions_as_of(
         (report_versions["announcement_date"] <= as_of_date)
         & (report_versions["end_date"] <= as_of_date)
     )
-    available = report_versions.loc[available_date_mask].copy()
 
-    available = available.sort_values(["ts_code", "end_date", "announcement_date"])
-
-    available = available.drop_duplicates(["ts_code", "end_date"], keep="last")
-
-    available = available.reset_index(drop=True)
+    available = (
+        report_versions.loc[available_date_mask].copy()
+        .sort_values(["ts_code", "end_date", "announcement_date"])
+        .drop_duplicates(["ts_code", "end_date"], keep="last")
+        .reset_index(drop=True)
+    )
 
     return available
 
 
 def _empty_financial_snapshot() -> pd.DataFrame:
-    """返回具有稳定字段结构的空月末财务快照。"""
+    """
+    返回具有稳定字段结构的空月末财务快照。
+    可以由此查看月末财务快照有哪些字段。
+    """
 
-    columns = [
-        "stock_code",
+    datetime_columns = (
         "date",
         "end_date",
         "announcement_date",
@@ -415,14 +441,27 @@ def _empty_financial_snapshot() -> pd.DataFrame:
         "prior_same_announcement_date",
         "prior_annual_announcement_date",
         "balance_announcement_date",
+    )
+    numeric_columns = (
         "revenue_ttm",
         "net_profit_ttm",
         "gross_profit_ttm",
         "total_assets",
         "total_equity",
-    ]
-
-    return pd.DataFrame(columns=columns)
+    )
+    return pd.DataFrame(
+        {
+            "stock_code": pd.Series(dtype="string"),
+            **{
+                column: pd.Series(dtype="datetime64[ns]")
+                for column in datetime_columns
+            },
+            **{
+                column: pd.Series(dtype="float64")
+                for column in numeric_columns
+            },
+        }
+    )
 
 
 def _calculate_financial_snapshot_as_of(
@@ -436,10 +475,15 @@ def _calculate_financial_snapshot_as_of(
         return _empty_financial_snapshot()
 
     result = income_as_of.copy()
+
     result["year"] = result["end_date"].dt.year
+
     result["month"] = result["end_date"].dt.month
+
     period_keys = ["ts_code", "year", "month"]
+
     duplicated_periods = result.duplicated(period_keys, keep=False)
+
     if duplicated_periods.any():
         examples = result.loc[duplicated_periods, "ts_code"].drop_duplicates().head(5)
         raise ValueError(
@@ -448,6 +492,7 @@ def _calculate_financial_snapshot_as_of(
         )
 
     lookup = result.set_index(period_keys)
+
     prior_same_index = pd.MultiIndex.from_arrays(
         [
             result["ts_code"],
@@ -456,6 +501,7 @@ def _calculate_financial_snapshot_as_of(
         ],
         names=period_keys,
     )
+
     prior_annual_index = pd.MultiIndex.from_arrays(
         [
             result["ts_code"],
@@ -464,16 +510,21 @@ def _calculate_financial_snapshot_as_of(
         ],
         names=period_keys,
     )
+
     prior_same_announcement = lookup["announcement_date"].reindex(
         prior_same_index
     )
+
     prior_annual_announcement = lookup["announcement_date"].reindex(
         prior_annual_index
     )
+
     result["prior_same_announcement_date"] = prior_same_announcement.to_numpy()
+
     result["prior_annual_announcement_date"] = prior_annual_announcement.to_numpy()
 
     values = ["revenue", "oper_cost", "n_income_attr_p"]
+
     for value in values:
         prior_same = lookup[value].reindex(prior_same_index).to_numpy()
         prior_annual = lookup[value].reindex(prior_annual_index).to_numpy()
@@ -483,19 +534,23 @@ def _calculate_financial_snapshot_as_of(
         )
 
     annual_rows = result["month"].eq(12)
+
     result.loc[
         annual_rows,
         ["prior_same_announcement_date", "prior_annual_announcement_date"],
     ] = pd.NaT
+
     result = result.rename(
         columns={
             "announcement_date": "current_income_announcement_date",
             "n_income_attr_p_ttm": "net_profit_ttm",
         }
     )
+
     result["gross_profit_ttm"] = (
         result["revenue_ttm"] - result["oper_cost_ttm"]
     )
+
     result = (
         result.sort_values(["ts_code", "end_date"])
         .drop_duplicates("ts_code", keep="last")
@@ -508,32 +563,40 @@ def _calculate_financial_snapshot_as_of(
         "total_assets",
         "total_hldr_eqy_exc_min_int",
     ]
+
     balance_current = balance_as_of[balance_columns].rename(
         columns={
             "announcement_date": "balance_announcement_date",
             "total_hldr_eqy_exc_min_int": "total_equity",
         }
     )
+
     snapshot = result.merge(
         balance_current,
         on=["ts_code", "end_date"],
         how="left",
         validate="one_to_one",
     )
+
     availability_columns = [
         "current_income_announcement_date",
         "prior_same_announcement_date",
         "prior_annual_announcement_date",
         "balance_announcement_date",
     ]
+
     snapshot["financial_available_date"] = snapshot[
         availability_columns
     ].max(axis=1)
+
     snapshot["announcement_date"] = snapshot["financial_available_date"]
+
     snapshot["date"] = pd.Timestamp(as_of_date)
+
     snapshot = snapshot.rename(columns={"ts_code": "stock_code"})
 
     columns = _empty_financial_snapshot().columns
+
     return snapshot.loc[:, columns].sort_values("stock_code").reset_index(drop=True)
 
 
@@ -548,14 +611,16 @@ def build_monthly_financial_snapshots(
     计算 TTM。后续修订只会影响修订公告日之后的快照，不会覆盖历史时点。
     """
 
-    income_versions = prepare_report_versions(
+    income_versions = _prepare_report_versions(
         income,
         value_columns=["revenue", "oper_cost", "n_income_attr_p"],
     )
-    balance_versions = prepare_report_versions(
+
+    balance_versions = _prepare_report_versions(
         balancesheet,
         value_columns=["total_assets", "total_hldr_eqy_exc_min_int"],
     )
+
     dates = (
         pd.to_datetime(rebalance_dates["date"], errors="coerce")
         .dropna()
@@ -564,11 +629,12 @@ def build_monthly_financial_snapshots(
     )
 
     snapshots: list[pd.DataFrame] = []
+
     for as_of_date in dates:
-        income_as_of = select_latest_report_versions_as_of(
+        income_as_of = _select_latest_report_versions_as_of(
             income_versions, as_of_date
         )
-        balance_as_of = select_latest_report_versions_as_of(
+        balance_as_of = _select_latest_report_versions_as_of(
             balance_versions, as_of_date
         )
         snapshots.append(
@@ -581,26 +647,21 @@ def build_monthly_financial_snapshots(
 
     if not snapshots:
         return _empty_financial_snapshot()
+    
     panel = pd.concat(snapshots, ignore_index=True)
+
     if panel.duplicated(["date", "stock_code"]).any():
         raise ValueError("月末财务快照存在重复的 date-stock_code 主键")
     future_information = panel["financial_available_date"].gt(panel["date"])
     if future_information.any():
         raise ValueError("月末财务快照使用了调仓日之后才公告的财报版本")
-    return panel.sort_values(["date", "stock_code"]).reset_index(drop=True)
 
-
-def _monthly_rebalance_dates(calendar: pd.DataFrame) -> pd.DataFrame:
-    """返回每个自然月最后一个开市交易日。"""
-
-    dates = (
-        _as_timestamp(calendar["cal_date"])
-        .dropna()
-        .drop_duplicates()
-        .sort_values()
+    panel = (
+        panel.sort_values(["date", "stock_code"])
+        .reset_index(drop=True)
     )
-    month_end = dates.groupby(dates.dt.to_period("M")).max()
-    return pd.DataFrame({"date": month_end.to_numpy()})
+
+    return panel
 
 
 def _listing_age_in_trading_days(
@@ -677,15 +738,17 @@ def build_monthly_universe(
     """
 
     start, end = pd.Timestamp(config.study_start), pd.Timestamp(config.study_end)
+
     rebalance_dates = _monthly_rebalance_dates(calendar)
+
     rebalance_dates = rebalance_dates.loc[
         rebalance_dates["date"].between(start, end)
     ]
-    monthly = price_daily.merge(rebalance_dates, on="date", how="inner").copy()
 
     stock_information = stock_basic[
         ["ts_code", "list_date", "delist_date"]
     ].rename(columns={"ts_code": "stock_code"})
+
     duplicated_codes = stock_information["stock_code"].duplicated(keep=False)
     if duplicated_codes.any():
         examples = (
@@ -698,9 +761,25 @@ def build_monthly_universe(
             + ", ".join(examples.astype(str))
         )
 
+    stock_information["list_date"] = _as_timestamp(
+        stock_information["list_date"]
+    )
+
+    stock_information["delist_date"] = _as_timestamp(
+        stock_information["delist_date"]
+    )
+
+    month_end_prices = price_daily.merge(
+        rebalance_dates,
+        on="date",
+        how="inner",
+        validate="many_to_one",
+    ).copy()
     known_codes = set(stock_information["stock_code"].dropna().astype(str))
     unknown_codes = sorted(
-        set(monthly["stock_code"].dropna().astype(str)).difference(known_codes)
+        set(month_end_prices["stock_code"].dropna().astype(str)).difference(
+            known_codes
+        )
     )
     if unknown_codes:
         examples = ", ".join(unknown_codes[:5])
@@ -710,18 +789,32 @@ def build_monthly_universe(
             "请在构建日频面板时使用沪深股票白名单。"
         )
 
-    monthly = monthly.merge(
-        stock_information,
-        on="stock_code",
-        how="left",
-        validate="many_to_one",
-    )
-    monthly["list_date"] = _as_timestamp(monthly["list_date"])
-    monthly["delist_date"] = _as_timestamp(monthly["delist_date"])
-    monthly["is_listed"] = monthly["date"].ge(monthly["list_date"]) & (
+    # 先构造完整的月末股票骨架，再按上市区间保留理论有效记录。
+    monthly = rebalance_dates.merge(stock_information, how="cross")
+
+    monthly["is_listed"] = (monthly["date"]>=monthly["list_date"]) & (
         monthly["delist_date"].isna()
-        | monthly["date"].le(monthly["delist_date"])
+        | (monthly["date"]<=monthly["delist_date"])
     )
+
+    monthly = monthly.loc[monthly["is_listed"]].copy()
+
+    # 行情只是月度股票池的属性；月末没有行情的停牌股票仍保留在骨架中。
+    month_end_prices["has_price_record"] = True
+
+    # 合并后月末有交易记录的 has_price_record 自动为 True
+    monthly = monthly.merge(
+        month_end_prices,
+        on=["date", "stock_code"],
+        how="left",
+        validate="one_to_one",
+    )
+
+    # 月末停牌股票的 has_price_record 记为 False
+    monthly["has_price_record"] = (
+        monthly["has_price_record"].fillna(False).astype(bool)
+    )
+
     monthly["listing_trading_days"] = _listing_age_in_trading_days(
         monthly["date"],
         monthly["list_date"],
@@ -729,6 +822,7 @@ def build_monthly_universe(
     )
 
     monthly["is_st"] = False
+
     if st_records is not None and not st_records.empty:
         st_keys = (
             st_records[["ts_code", "trade_date"]]
@@ -747,6 +841,7 @@ def build_monthly_universe(
         )
 
     monthly["is_suspended"] = False
+
     if suspension_records is not None and not suspension_records.empty:
         suspension_keys = (
             suspension_records[["ts_code", "trade_date"]]
@@ -766,16 +861,20 @@ def build_monthly_universe(
         )
 
     required_financial_columns = {"stock_code", "date", "financial_available_date"}
+
     missing_financial_columns = required_financial_columns.difference(
         financial_snapshots.columns
     )
+
     if missing_financial_columns:
         raise ValueError(
             "月末财务快照缺少必需字段："
             f"{sorted(missing_financial_columns)}"
         )
+    
     if financial_snapshots.duplicated(["date", "stock_code"]).any():
         raise ValueError("月末财务快照存在重复的 date-stock_code 主键")
+    
     monthly = monthly.merge(
         financial_snapshots,
         on=["stock_code", "date"],
@@ -826,6 +925,7 @@ def build_monthly_universe(
 
     monthly["is_eligible"] = (
         monthly["is_listed"]
+        & monthly["has_price_record"]
         & ~monthly["is_st"].fillna(False)
         & ~monthly["is_suspended"].fillna(False)
         & monthly["is_buyable"]
@@ -863,49 +963,70 @@ def run_preprocess_pipeline(
 ) -> tuple[Path, Path]:
     """读取 ``data/raw`` 并运行完整的 Notebook 01 预处理流程。"""
 
+    # ==========
+    # 构建日频面板 
+    # ==========
+
     calendar = pd.read_parquet(raw_directory / "trade_calendar.parquet")
+
     stocks = select_sh_sz_stock_basic(
         pd.read_parquet(raw_directory / "stock_basic.parquet")
     )
+
     allowed_stock_codes = set(stocks["ts_code"].dropna().astype(str))
-    income = filter_stock_records(
+
+    price_daily = build_price_daily(
+        raw_directory,
+        allowed_stock_codes=allowed_stock_codes,
+    )
+
+    # ============
+    # 构建月度股票池 
+    # ============
+
+    rebalance_dates = _monthly_rebalance_dates(calendar)
+
+    study_start = pd.Timestamp(config.study_start)
+
+    study_end = pd.Timestamp(config.study_end)
+
+    rebalance_dates = rebalance_dates.loc[
+        rebalance_dates["date"].between(study_start, study_end)
+    ]
+
+    income = stock_filter(
         pd.read_parquet(raw_directory / "income.parquet"),
         allowed_stock_codes,
     )
-    balancesheet = filter_stock_records(
+
+    balancesheet = stock_filter(
         pd.read_parquet(raw_directory / "balancesheet.parquet"),
         allowed_stock_codes,
     )
-    membership = filter_stock_records(
+
+    membership = stock_filter(
         pd.read_parquet(raw_directory / "sw_industry_membership.parquet"),
         allowed_stock_codes,
     )
-    st_records = filter_stock_records(
+
+    st_records = stock_filter(
         read_date_partitions(raw_directory / "stock_st"),
         allowed_stock_codes,
     )
-    suspension_records = filter_stock_records(
+
+    suspension_records = stock_filter(
         read_date_partitions(raw_directory / "suspend_d"),
         allowed_stock_codes,
     )
 
-    prices = build_price_daily(
-        raw_directory,
-        allowed_stock_codes=allowed_stock_codes,
-    )
-    rebalance_dates = _monthly_rebalance_dates(calendar)
-    study_start = pd.Timestamp(config.study_start)
-    study_end = pd.Timestamp(config.study_end)
-    rebalance_dates = rebalance_dates.loc[
-        rebalance_dates["date"].between(study_start, study_end)
-    ]
     financial_snapshots = build_monthly_financial_snapshots(
         income,
         balancesheet,
         rebalance_dates,
     )
-    universe = build_monthly_universe(
-        prices,
+
+    universe_monthly = build_monthly_universe(
+        price_daily,
         calendar,
         stocks,
         financial_snapshots,
@@ -914,8 +1035,9 @@ def run_preprocess_pipeline(
         industry_membership=membership,
         config=config,
     )
+
     return save_notebook01_outputs(
-        prices,
-        universe,
+        price_daily,
+        universe_monthly,
         processed_directory=processed_directory,
     )
