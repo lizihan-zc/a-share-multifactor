@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import pandas as pd
 
 from ._utils import require_columns, safe_ratio
@@ -21,15 +23,37 @@ def calculate_gross_profitability(
     *,
     gross_profit_column: str = "gross_profit_ttm",
     assets_column: str = "total_assets",
+    applicability_column: Optional[str] = None,
 ) -> pd.Series:
-    """逐行计算 ``毛利润 TTM / 总资产``。"""
+    """逐行计算 ``毛利润 TTM / 总资产``。
 
+    提供 ``applicability_column`` 时，只为明确标记为适用的记录返回因子值；
+    False 或缺失标记对应的结果为缺失。
+    """
+
+    required = {gross_profit_column, assets_column}
+    if applicability_column is not None:
+        required.add(applicability_column)
     require_columns(
-        panel, {gross_profit_column, assets_column}, dataset_name="panel"
+        panel, required, dataset_name="panel"
     )
-    return safe_ratio(
+    result = safe_ratio(
         panel[gross_profit_column], panel[assets_column], name=FACTOR_NAME
     )
+    if applicability_column is not None:
+        try:
+            applicable = (
+                panel[applicability_column]
+                .astype("boolean")
+                .fillna(False)
+                .astype(bool)
+            )
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"{applicability_column} 必须只包含布尔值或缺失值"
+            ) from exc
+        result = result.where(applicable)
+    return result
 
 
 calculate_gp = calculate_gross_profitability

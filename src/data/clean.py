@@ -74,6 +74,8 @@ UNIVERSE_MONTHLY_REQUIRED_COLUMNS = frozenset(
         "passes_listing_age",
         "passes_liquidity",
         "has_core_data",
+        "is_gross_profit_applicable",
+        "has_gp_factor_data",
         "is_eligible",
     }
 )

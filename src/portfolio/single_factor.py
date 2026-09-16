@@ -34,6 +34,7 @@ def calculate_quintile_returns(
     min_observations: int = 30,
 ) -> pd.DataFrame:
     """逐月按因子从低到高等频分组，并计算下一期等权组合收益。
+    返回每个调仓日每个因子 Q1~Q5 的 return. (DataFrame)
 
     因子值相同时使用股票代码作为稳定的次级排序键，使结果可重复。每个因子、
     每个月独立删除因子或收益缺失的股票；有效样本不足时不生成该月结果。
@@ -49,6 +50,7 @@ def calculate_quintile_returns(
         raise ValueError("min_observations 不能小于 n_quantiles")
     if not isinstance(factor_panel, pd.DataFrame):
         raise TypeError("factor_panel 必须是 pandas DataFrame")
+    
     required = {date_column, stock_column, return_column, *factors}
     missing = sorted(required.difference(factor_panel.columns))
     if missing:
@@ -57,13 +59,18 @@ def calculate_quintile_returns(
     panel = factor_panel.loc[
         :, [date_column, stock_column, return_column, *factors]
     ].copy()
+
     panel[date_column] = pd.to_datetime(panel[date_column], errors="coerce")
+
     panel[stock_column] = panel[stock_column].astype("string").str.strip().str.upper()
+
     if panel[date_column].isna().any() or panel[stock_column].isna().any():
         raise ValueError("factor_panel 包含无效的日期或股票代码")
     if panel.duplicated([date_column, stock_column]).any():
         raise ValueError("factor_panel 包含重复的 (date, stock_code) 主键")
+    
     panel[return_column] = _finite_numeric(panel[return_column])
+
     for factor in factors:
         panel[factor] = _finite_numeric(panel[factor])
 
@@ -125,7 +132,11 @@ def build_factor_return_panel(
     *,
     n_quantiles: int = 5,
 ) -> pd.DataFrame:
-    """将一个因子的分组收益转为宽表，并添加最高组减最低组收益。"""
+    """
+    将一个因子的分组收益转为宽表，并添加最高组减最低组收益。
+    返回某个因子在每个调仓日 Q1~Q5 的 return 和 long-short.
+    而 Notebook 05 为每个因子分别构造了一个宽表。
+    """
 
     if not isinstance(quintile_returns, pd.DataFrame):
         raise TypeError("quintile_returns 必须是 pandas DataFrame")

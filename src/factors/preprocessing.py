@@ -51,11 +51,13 @@ def preprocess_factor_panel(
     directions: Optional[Mapping[str, int]] = None,
     lower_quantile: float = 0.01,
     upper_quantile: float = 0.99,
+    sample_mask: Optional[pd.Series] = None,
 ) -> pd.DataFrame:
     """在每个日期独立完成去极值、方向统一和 Z-score 标准化。
 
     因子方向只能为 ``1``（越大越好）或 ``-1``（越小越好）。先去极值，再按需反转
-    方向。结果保留原因子列名，便于后续 Notebook 在原始面板和标准化面板之间切换。
+    方向。``sample_mask`` 用于限定估计和生成标准化因子的横截面；掩码外的上下文字段
+    继续保留，因子值则设为缺失。未提供掩码时兼容原行为，使用全部记录。
     """
 
     factor_columns = tuple(factor_columns)
@@ -69,18 +71,33 @@ def preprocess_factor_panel(
     if unknown:
         raise ValueError(f"directions 包含未知因子列：{unknown}")
 
+    if sample_mask is None:
+        selected = pd.Series(True, index=factor_panel.index, dtype="bool")
+    else:
+        if not isinstance(sample_mask, pd.Series):
+            raise TypeError("sample_mask 必须是 pandas Series")
+        if not sample_mask.index.equals(factor_panel.index):
+            raise ValueError("sample_mask 的索引必须与 factor_panel 完全一致")
+        try:
+            selected = sample_mask.astype("boolean").fillna(False).astype(bool)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("sample_mask 必须只包含布尔值或缺失值") from exc
+
     processed = factor_panel.copy()
+    reference = factor_panel.loc[selected]
     for column in factor_columns:
         direction = directions.get(column, 1)
         if direction not in (-1, 1):
             raise ValueError(f"{column} 的 direction 必须为 1 或 -1")
         clipped = winsorize_cross_section(
-            processed[column],
-            processed[date_column],
+            reference[column],
+            reference[date_column],
             lower_quantile=lower_quantile,
             upper_quantile=upper_quantile,
         )
-        processed[column] = zscore_cross_section(
-            clipped.mul(direction), processed[date_column]
+        standardized = zscore_cross_section(
+            clipped.mul(direction), reference[date_column]
         )
+        processed[column] = np.nan
+        processed.loc[selected, column] = standardized.to_numpy()
     return processed

@@ -7,6 +7,8 @@ import pandas as pd
 import pytest
 
 from src.factors import (
+    build_raw_factor_panel,
+    build_zscore_factor_panel,
     calculate_amihud_illiquidity,
     calculate_book_to_price,
     calculate_earnings_to_price,
@@ -64,6 +66,40 @@ def test_accounting_ratios_and_size() -> None:
     assert calculate_earnings_to_price(panel).iloc[2:].isna().all()
     assert calculate_gross_profitability(panel).iloc[2:].isna().all()
     assert calculate_size(panel).iloc[2:].isna().all()
+
+
+def test_raw_factor_panel_excludes_gp_where_not_applicable() -> None:
+    """验证金融行业即使存在毛利润字段，也不会生成 GP 因子。"""
+
+    daily = make_daily()
+    factor_date = daily["date"].max()
+    monthly = pd.DataFrame(
+        {
+            "date": [factor_date, factor_date],
+            "stock_code": ["A", "B"],
+            "end_date": pd.to_datetime(["2019-12-31", "2019-12-31"]),
+            "market_cap": [500.0, 500.0],
+            "total_assets": [200.0, 200.0],
+            "total_equity": [100.0, 100.0],
+            "net_profit_ttm": [10.0, 10.0],
+            "gross_profit_ttm": [30.0, 30.0],
+            "is_gross_profit_applicable": [True, False],
+        }
+    )
+
+    factors = build_raw_factor_panel(
+        monthly,
+        daily,
+        include_optional=False,
+        context_columns=("date", "stock_code"),
+    )
+
+    assert factors.loc[
+        factors["stock_code"].eq("A"), "gross_profitability"
+    ].item() == pytest.approx(0.15)
+    assert factors.loc[
+        factors["stock_code"].eq("B"), "gross_profitability"
+    ].isna().all()
 
 
 def test_roe_uses_prior_year_same_period_equity() -> None:
@@ -199,3 +235,47 @@ def test_preprocessing_is_cross_sectional_and_direction_aware() -> None:
     assert np.allclose(by_date.mean(), 0)
     assert np.allclose(by_date.std(ddof=0), 1)
     assert processed.loc[0, "factor"] > processed.loc[2, "factor"]
+
+
+def test_preprocessing_uses_only_selected_cross_section() -> None:
+    """验证掩码外极端值不参与缩尾或标准化，并且输出因子保持缺失。"""
+
+    panel = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2020-01-31"] * 4),
+            "factor": [1.0, 2.0, 3.0, 1_000_000.0],
+            "is_eligible": [True, True, True, False],
+        }
+    )
+    processed = preprocess_factor_panel(
+        panel,
+        ["factor"],
+        lower_quantile=0,
+        upper_quantile=1,
+        sample_mask=panel["is_eligible"],
+    )
+
+    eligible = processed.loc[processed["is_eligible"], "factor"]
+    assert eligible.mean() == pytest.approx(0)
+    assert eligible.std(ddof=0) == pytest.approx(1)
+    assert processed.loc[~processed["is_eligible"], "factor"].isna().all()
+
+
+def test_zscore_panel_uses_is_eligible_without_dropping_context_rows() -> None:
+    """验证标准化面板保留完整骨架，但非研究股票不影响研究样本。"""
+
+    raw = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2020-01-31"] * 4),
+            "stock_code": ["A", "B", "C", "D"],
+            "is_eligible": [True, True, True, False],
+            "ep": [1.0, 2.0, 3.0, 1_000_000.0],
+        }
+    )
+    result = build_zscore_factor_panel(raw, factor_columns=["ep"])
+
+    assert result[["date", "stock_code"]].equals(raw[["date", "stock_code"]])
+    eligible = result.loc[result["is_eligible"], "ep"]
+    assert eligible.mean() == pytest.approx(0)
+    assert eligible.std(ddof=0) == pytest.approx(1)
+    assert result.loc[~result["is_eligible"], "ep"].isna().all()

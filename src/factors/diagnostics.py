@@ -106,7 +106,7 @@ def calculate_average_factor_correlation(
     method: str = "spearman",
     min_observations: int = 30,
 ) -> pd.DataFrame:
-    """计算每月横截面因子相关系数，再对月份做等权时间平均。"""
+    """计算同一个月、不同因子之间的横截面相关性，再对月份做等权时间平均。"""
 
     factors = _validate_factor_columns(factor_columns)
     if method not in {"spearman", "pearson"}:
@@ -148,7 +148,7 @@ def calculate_factor_rank_autocorrelation(
     stock_column: str = "stock_code",
     min_observations: int = 30,
 ) -> pd.DataFrame:
-    """计算相邻调仓日共同股票的因子排名 Spearman 自相关。
+    """计算同一个因子在相邻两个月之间的排名相关性。
 
     返回长表；``date`` 表示当前调仓日，``previous_date`` 表示与之比较的上一个
     调仓日。相关系数按因子成对删除缺失值，``n_stocks`` 是实际有效股票数。

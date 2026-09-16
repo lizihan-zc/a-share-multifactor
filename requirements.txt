@@ -1,36 +1,20 @@
-# Python 3.9 compatible dependencies for the A-share multifactor project.
+# Python 3.9 compatible dependencies used by this project.
 
-# Core data analysis and factor research
+# Data processing and Parquet storage
 numpy==1.26.4
 pandas==2.2.3
-scipy==1.13.1
-statsmodels==0.14.4
-scikit-learn==1.5.2
-
-# Storage and configuration
 pyarrow==17.0.0
-PyYAML==6.0.2
-openpyxl==3.1.5
-xlrd==2.0.2
+
+# Tushare data download and environment configuration
+tushare==1.4.21
 python-dotenv==1.0.1
 
-# Market-data access (use the provider for which credentials are available)
-akshare==1.17.99
-tushare==1.4.21
-jqdatasdk==1.9.7
-rqdatac==3.4.7.8
-requests==2.32.3
-dotenv
-
-# Charts and research reporting
+# Notebook analysis and visualization
 matplotlib==3.8.4
 seaborn==0.13.2
-plotly==5.24.1
-
-# Notebooks, progress reporting, and tests
+ipython==8.18.1
 jupyterlab==4.3.4
 ipykernel==6.29.5
-tqdm==4.67.1
+
+# Tests
 pytest==8.3.4
-pathlib
-sys

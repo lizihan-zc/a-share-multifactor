@@ -11,8 +11,9 @@
    分别保存交易日历与包含退市股票的基础信息。
 3. 下载日频数据：调用 ``download_market_partitions``，按交易日分区下载 ``daily``、
    ``adj_factor``、``daily_basic``、``stk_limit``、``suspend_d`` 和 ``stock_st``。
-4. 下载财务与行业数据：调用 ``download_financial_statements`` 取得利润表和资产负债表；
-   调用 ``download_industry_membership`` 取得历史申万行业有效区间。
+4. 下载财务与行业数据：调用 ``download_financial_statements``，按股票分区取得利润表
+   和资产负债表，并维护区间覆盖清单；调用 ``download_industry_membership`` 取得历史
+   申万行业有效区间。
 5. 如需执行完整下载流程，调用 ``run_download_pipeline``；如只需补充某类原始数据，
    则调用对应的单个下载函数。
 """
@@ -51,6 +52,32 @@ MARKET_DATASETS: Mapping[str, tuple[str, Mapping[str, str]]] = {
     ),
     "stock_st": ("ts_code,name,trade_date,type,type_name", {}),
 }
+
+FINANCIAL_DATASETS: Mapping[str, str] = {
+    "income": (
+        "ts_code,ann_date,f_ann_date,end_date,report_type,comp_type,"
+        "revenue,oper_cost,n_income_attr_p,update_flag"
+    ),
+    "balancesheet": (
+        "ts_code,ann_date,f_ann_date,end_date,report_type,comp_type,"
+        "total_assets,total_hldr_eqy_exc_min_int,"
+        "total_hldr_eqy_inc_min_int,update_flag"
+    ),
+}
+FINANCIAL_MANIFEST_NAME = "financial_download_manifest.parquet"
+FINANCIAL_SCHEMA_VERSION = 1
+FINANCIAL_MANIFEST_COLUMNS = (
+    "dataset",
+    "stock_code",
+    "range_start",
+    "range_end",
+    "status",
+    "row_count",
+    "updated_at",
+    "schema_version",
+    "fields_signature",
+    "source",
+)
 
 
 @dataclass(frozen=True)
@@ -119,6 +146,260 @@ def _write_parquet_atomic(frame: pd.DataFrame, path: Path) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     frame.to_parquet(temporary, index=False)
     temporary.replace(path)
+
+
+def _empty_financial_manifest() -> pd.DataFrame:
+    """返回财务分区下载清单的稳定空表结构。"""
+
+    return pd.DataFrame(
+        {
+            "dataset": pd.Series(dtype="string"),
+            "stock_code": pd.Series(dtype="string"),
+            "range_start": pd.Series(dtype="datetime64[ns]"),
+            "range_end": pd.Series(dtype="datetime64[ns]"),
+            "status": pd.Series(dtype="string"),
+            "row_count": pd.Series(dtype="int64"),
+            "updated_at": pd.Series(dtype="datetime64[ns]"),
+            "schema_version": pd.Series(dtype="int64"),
+            "fields_signature": pd.Series(dtype="string"),
+            "source": pd.Series(dtype="string"),
+        }
+    )
+
+
+def _load_financial_manifest(path: Path) -> pd.DataFrame:
+    """读取并校验逐股财务下载清单。"""
+
+    if not path.is_file():
+        return _empty_financial_manifest()
+    manifest = pd.read_parquet(path)
+    missing = sorted(set(FINANCIAL_MANIFEST_COLUMNS).difference(manifest.columns))
+    if missing:
+        raise ValueError(f"财务下载清单缺少字段：{missing}")
+    manifest = manifest.loc[:, list(FINANCIAL_MANIFEST_COLUMNS)].copy()
+    manifest["range_start"] = pd.to_datetime(
+        manifest["range_start"], errors="coerce"
+    )
+    manifest["range_end"] = pd.to_datetime(manifest["range_end"], errors="coerce")
+    manifest["updated_at"] = pd.to_datetime(manifest["updated_at"], errors="coerce")
+    invalid_range = (
+        manifest["range_start"].isna()
+        | manifest["range_end"].isna()
+        | manifest["range_start"].gt(manifest["range_end"])
+    )
+    if invalid_range.any():
+        raise ValueError("财务下载清单包含无效日期区间")
+    return manifest
+
+
+def _financial_partition_path(
+    raw_directory: Path,
+    dataset: str,
+    stock_code: str,
+) -> Path:
+    """返回单个数据集、单只股票的 Parquet 分区路径。"""
+
+    stock_code = str(stock_code).strip().upper()
+    if (
+        not stock_code
+        or Path(stock_code).name != stock_code
+        or stock_code in {".", ".."}
+    ):
+        raise ValueError(f"非法股票代码，无法构造分区路径：{stock_code!r}")
+    return raw_directory / dataset / f"ts_code={stock_code}.parquet"
+
+
+def _parse_tushare_dates(values: pd.Series) -> pd.Series:
+    """兼容 Tushare 字符串日期以及 Parquet 中已有的时间戳。"""
+
+    text = values.astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+    compact = pd.to_datetime(text, format="%Y%m%d", errors="coerce")
+    fallback = pd.to_datetime(values, errors="coerce")
+    return compact.fillna(fallback)
+
+
+def _effective_announcement_date(frame: pd.DataFrame) -> pd.Series:
+    """使用实际公告日，缺失时回退到公告日。"""
+
+    if "ann_date" not in frame.columns:
+        return pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
+    ann_date = _parse_tushare_dates(frame["ann_date"])
+    if "f_ann_date" not in frame.columns:
+        return ann_date
+    actual = _parse_tushare_dates(frame["f_ann_date"])
+    return actual.fillna(ann_date)
+
+
+def _calculate_missing_date_ranges(
+    requested_start: str,
+    requested_end: str,
+    completed_ranges: Iterable[tuple[pd.Timestamp, pd.Timestamp]],
+) -> list[tuple[str, str]]:
+    """从已完成区间中扣除当前请求，返回尚需请求的闭区间。"""
+
+    start = pd.Timestamp(requested_start).normalize()
+    end = pd.Timestamp(requested_end).normalize()
+    if start > end:
+        raise ValueError("start_date 必须早于或等于 end_date")
+
+    clipped: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    for range_start, range_end in completed_ranges:
+        left = max(start, pd.Timestamp(range_start).normalize())
+        right = min(end, pd.Timestamp(range_end).normalize())
+        if left <= right:
+            clipped.append((left, right))
+    clipped.sort()
+
+    merged: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    one_day = pd.Timedelta(days=1)
+    for left, right in clipped:
+        if not merged or left > merged[-1][1] + one_day:
+            merged.append((left, right))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], right))
+
+    missing: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    cursor = start
+    for left, right in merged:
+        if cursor < left:
+            missing.append((cursor, left - one_day))
+        cursor = max(cursor, right + one_day)
+    if cursor <= end:
+        missing.append((cursor, end))
+    return [
+        (left.strftime("%Y%m%d"), right.strftime("%Y%m%d"))
+        for left, right in missing
+    ]
+
+
+def _merge_financial_records(
+    existing: pd.DataFrame,
+    downloaded: pd.DataFrame,
+) -> pd.DataFrame:
+    """合并新旧财报，并保留不同公告日和报表类型的历史版本。"""
+
+    if existing.empty and downloaded.empty:
+        columns = list(dict.fromkeys([*existing.columns, *downloaded.columns]))
+        return pd.DataFrame(columns=columns)
+
+    required = {"ts_code", "end_date", "ann_date", "report_type"}
+    for name, frame in (("existing", existing), ("downloaded", downloaded)):
+        if frame.empty:
+            continue
+        missing = sorted(required.difference(frame.columns))
+        if missing:
+            raise ValueError(f"{name} 财务数据缺少版本字段：{missing}")
+
+    old = existing.copy()
+    new = downloaded.copy()
+    old["_download_priority"] = 0
+    new["_download_priority"] = 1
+    column_order = list(dict.fromkeys([*old.columns, *new.columns]))
+    # 丢掉单个输入中全空的列后再拼接，避免 pandas 对全空列 dtype 推断的
+    # 兼容性警告；随后按并集补回这些列，落盘结构不会改变。
+    merge_parts = [
+        part.dropna(axis="columns", how="all")
+        for part in (old, new)
+        if not part.empty
+    ]
+    combined = pd.concat(merge_parts, ignore_index=True, sort=False).reindex(
+        columns=column_order
+    )
+    combined["_source_order"] = range(len(combined))
+    combined["_announcement_key"] = _effective_announcement_date(combined)
+    combined["_end_date_key"] = _parse_tushare_dates(combined["end_date"])
+    combined["_report_type_key"] = combined["report_type"].astype("string")
+    combined["_update_priority"] = pd.to_numeric(
+        combined.get("update_flag", pd.Series(index=combined.index, dtype="float64")),
+        errors="coerce",
+    ).fillna(-1)
+    key = ["ts_code", "_end_date_key", "_announcement_key", "_report_type_key"]
+    combined = (
+        combined.sort_values(
+            [*key, "_update_priority", "_download_priority", "_source_order"],
+            na_position="first",
+        )
+        .drop_duplicates(key, keep="last")
+        .sort_values(["ts_code", "_end_date_key", "_announcement_key"])
+        .drop(
+            columns=[
+                "_download_priority",
+                "_source_order",
+                "_announcement_key",
+                "_end_date_key",
+                "_report_type_key",
+                "_update_priority",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+    return combined
+
+
+def _manifest_completed_ranges(
+    manifest: pd.DataFrame,
+    *,
+    dataset: str,
+    stock_code: str,
+    fields_signature: str,
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """取得与当前字段版本相符的已完成下载区间。"""
+
+    selected = manifest.loc[
+        manifest["dataset"].eq(dataset)
+        & manifest["stock_code"].eq(stock_code)
+        & manifest["status"].isin(["complete", "inferred_existing"])
+        & manifest["schema_version"].eq(FINANCIAL_SCHEMA_VERSION)
+        & manifest["fields_signature"].eq(fields_signature)
+    ]
+    return list(zip(selected["range_start"], selected["range_end"]))
+
+
+def _append_manifest_record(
+    manifest: pd.DataFrame,
+    *,
+    dataset: str,
+    stock_code: str,
+    range_start: str,
+    range_end: str,
+    status: str,
+    row_count: int,
+    fields_signature: str,
+    source: str,
+) -> pd.DataFrame:
+    """追加一条覆盖记录，并使同一区间的最新状态具有唯一性。"""
+
+    record = pd.DataFrame(
+        [
+            {
+                "dataset": dataset,
+                "stock_code": stock_code,
+                "range_start": pd.Timestamp(range_start),
+                "range_end": pd.Timestamp(range_end),
+                "status": status,
+                "row_count": int(row_count),
+                "updated_at": pd.Timestamp.now(tz="UTC").tz_localize(None),
+                "schema_version": FINANCIAL_SCHEMA_VERSION,
+                "fields_signature": fields_signature,
+                "source": source,
+            }
+        ]
+    )
+    combined = pd.concat([manifest, record], ignore_index=True)
+    deduplication_key = [
+        "dataset",
+        "stock_code",
+        "range_start",
+        "range_end",
+        "schema_version",
+        "fields_signature",
+    ]
+    return (
+        combined.sort_values("updated_at")
+        .drop_duplicates(deduplication_key, keep="last")
+        .loc[:, list(FINANCIAL_MANIFEST_COLUMNS)]
+        .reset_index(drop=True)
+    )
 
 
 def download_trade_calendar(
@@ -225,54 +506,192 @@ def download_financial_statements(
     start_date: str,
     end_date: str,
     raw_directory: Path,
+    manifest_path: Optional[Path] = None,
     pause_seconds: float = 0.2,
-) -> None:
-    """按股票下载利润表和资产负债表。
+) -> dict[str, Path]:
+    """按股票增量下载利润表和资产负债表，并逐股原子保存。
 
     标准 Tushare 接口按股票提供历史财务数据。具备 VIP 权限的账户可使用
-    ``income_vip`` 和 ``balancesheet_vip``，另行实现按报告期下载。
+    ``income_vip`` 和 ``balancesheet_vip``，另行实现按报告期下载。当前实现以
+    下载清单记录成功请求的闭区间，只补充未覆盖区间；API 返回空表也会记录为
+    已完成，避免重复请求。
+
+    旧版 ``income.parquet`` 和 ``balancesheet.parquet`` 会按股票逐步迁移到分区
+    目录。由于旧文件没有下载清单，只能把每只股票已有公告日的最小值到最大值
+    记为推断覆盖，区间两端仍会按当前请求补齐。
     """
 
-    stock_codes = list(stock_codes)
-    datasets = {
-        "income": (
-            "ts_code,ann_date,f_ann_date,end_date,report_type,comp_type,"
-            "revenue,oper_cost,n_income_attr_p,update_flag"
-        ),
-        "balancesheet": (
-            "ts_code,ann_date,f_ann_date,end_date,report_type,comp_type,"
-            "total_assets,total_hldr_eqy_exc_min_int,"
-            "total_hldr_eqy_inc_min_int,update_flag"
-        ),
-    }
+    requested_start = pd.Timestamp(start_date).normalize()
+    requested_end = pd.Timestamp(end_date).normalize()
+    if requested_start > requested_end:
+        raise ValueError("start_date 必须早于或等于 end_date")
+    normalized_codes = [
+        str(code).strip().upper() for code in stock_codes if pd.notna(code)
+    ]
+    normalized_codes = list(dict.fromkeys(code for code in normalized_codes if code))
+    if not normalized_codes:
+        raise ValueError("stock_codes 不能为空")
 
-    for api_name, fields in datasets.items():
-        output_path = raw_directory / f"{api_name}.parquet"
-        existing = (
-            pd.read_parquet(output_path) if output_path.exists() else pd.DataFrame()
+    raw_directory = Path(raw_directory)
+    manifest_path = (
+        raw_directory / FINANCIAL_MANIFEST_NAME
+        if manifest_path is None
+        else Path(manifest_path)
+    )
+    manifest = _load_financial_manifest(manifest_path)
+    outputs: dict[str, Path] = {}
+
+    for api_name, fields in FINANCIAL_DATASETS.items():
+        fields_signature = fields
+        field_columns = fields.split(",")
+        partition_directory = raw_directory / api_name
+        partition_directory.mkdir(parents=True, exist_ok=True)
+        outputs[api_name] = partition_directory
+
+        legacy_path = raw_directory / f"{api_name}.parquet"
+        legacy = (
+            pd.read_parquet(legacy_path)
+            if legacy_path.is_file()
+            else pd.DataFrame()
         )
-        done = set(existing.get("ts_code", pd.Series(dtype="string")).dropna())
-        parts = [existing] if not existing.empty else []
+        legacy_groups = None
+        legacy_codes: set[str] = set()
+        if not legacy.empty:
+            if "ts_code" not in legacy.columns:
+                raise ValueError(f"旧版 {legacy_path.name} 缺少 ts_code 字段")
+            legacy["ts_code"] = (
+                legacy["ts_code"].astype("string").str.strip().str.upper()
+            )
+            legacy_groups = legacy.groupby("ts_code", sort=False, observed=True)
+            legacy_codes = set(legacy["ts_code"].dropna().astype(str))
 
         endpoint = getattr(pro, api_name)
-        for stock_code in stock_codes:
-            if stock_code in done:
-                continue
-            frame = call_with_retry(
-                endpoint,
-                ts_code=stock_code,
-                start_date=start_date,
-                end_date=end_date,
-                fields=fields,
+        for stock_code in normalized_codes:
+            partition_path = _financial_partition_path(
+                raw_directory, api_name, stock_code
             )
-            parts.append(frame)
-            if pause_seconds:
-                time.sleep(pause_seconds)
+            if partition_path.is_file():
+                current = pd.read_parquet(partition_path)
+                has_current_schema = set(field_columns).issubset(current.columns)
+            elif stock_code in legacy_codes and legacy_groups is not None:
+                legacy_stock = legacy_groups.get_group(stock_code).copy()
+                has_current_schema = set(field_columns).issubset(
+                    legacy_stock.columns
+                )
+                current = _merge_financial_records(
+                    pd.DataFrame(columns=field_columns), legacy_stock
+                )
+                if has_current_schema:
+                    _write_parquet_atomic(current, partition_path)
+            else:
+                current = pd.DataFrame(columns=field_columns)
+                has_current_schema = True
+            if "ts_code" in current.columns:
+                current["ts_code"] = (
+                    current["ts_code"].astype("string").str.strip().str.upper()
+                )
+                current_codes = set(current["ts_code"].dropna().astype(str))
+                unexpected_codes = current_codes.difference({stock_code})
+                if unexpected_codes:
+                    raise ValueError(
+                        f"{partition_path.name} 包含其他股票："
+                        f"{sorted(unexpected_codes)[:5]}"
+                    )
+            # 旧版数据可能缺少后来新增的下载字段。保留旧行并补空列，但仍通过
+            # has_current_schema=False 触发完整区间重取。
+            for column in field_columns:
+                if column not in current.columns:
+                    current[column] = pd.NA
 
-        combined = (
-            pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-        )
-        _write_parquet_atomic(combined, output_path)
+            completed_ranges = (
+                _manifest_completed_ranges(
+                    manifest,
+                    dataset=api_name,
+                    stock_code=stock_code,
+                    fields_signature=fields_signature,
+                )
+                if partition_path.is_file() and has_current_schema
+                else []
+            )
+
+            # 兼容没有清单的旧文件或写入数据后、更新清单前发生中断的情况。
+            if not completed_ranges and not current.empty and has_current_schema:
+                announcement_dates = _effective_announcement_date(current).dropna()
+                if not announcement_dates.empty:
+                    inferred_start = announcement_dates.min().normalize()
+                    inferred_end = announcement_dates.max().normalize()
+                    manifest = _append_manifest_record(
+                        manifest,
+                        dataset=api_name,
+                        stock_code=stock_code,
+                        range_start=inferred_start.strftime("%Y%m%d"),
+                        range_end=inferred_end.strftime("%Y%m%d"),
+                        status="inferred_existing",
+                        row_count=len(current),
+                        fields_signature=fields_signature,
+                        source="existing_partition",
+                    )
+                    _write_parquet_atomic(manifest, manifest_path)
+                    completed_ranges = [(inferred_start, inferred_end)]
+
+            missing_ranges = _calculate_missing_date_ranges(
+                requested_start.strftime("%Y%m%d"),
+                requested_end.strftime("%Y%m%d"),
+                completed_ranges,
+            )
+            for missing_start, missing_end in missing_ranges:
+                downloaded = call_with_retry(
+                    endpoint,
+                    ts_code=stock_code,
+                    start_date=missing_start,
+                    end_date=missing_end,
+                    fields=fields,
+                )
+                if not isinstance(downloaded, pd.DataFrame):
+                    raise TypeError(f"{api_name} API 必须返回 pandas DataFrame")
+                if downloaded.empty:
+                    downloaded = pd.DataFrame(columns=field_columns)
+                else:
+                    missing_fields = sorted(
+                        set(field_columns).difference(downloaded.columns)
+                    )
+                    if missing_fields:
+                        raise ValueError(
+                            f"{api_name} API 返回缺少字段：{missing_fields}"
+                        )
+                    downloaded["ts_code"] = (
+                        downloaded["ts_code"]
+                        .astype("string")
+                        .str.strip()
+                        .str.upper()
+                    )
+                    returned_codes = set(downloaded["ts_code"].dropna().astype(str))
+                    if returned_codes != {stock_code}:
+                        raise ValueError(
+                            f"{api_name} API 返回的股票代码与请求不一致："
+                            f"请求 {stock_code}，返回 {sorted(returned_codes)[:5]}"
+                        )
+
+                current = _merge_financial_records(current, downloaded)
+                # 必须先提交数据，再提交清单；中断时最多重复请求，不会错误跳过。
+                _write_parquet_atomic(current, partition_path)
+                manifest = _append_manifest_record(
+                    manifest,
+                    dataset=api_name,
+                    stock_code=stock_code,
+                    range_start=missing_start,
+                    range_end=missing_end,
+                    status="complete",
+                    row_count=len(downloaded),
+                    fields_signature=fields_signature,
+                    source="tushare_api",
+                )
+                _write_parquet_atomic(manifest, manifest_path)
+                if pause_seconds:
+                    time.sleep(pause_seconds)
+
+    outputs["manifest"] = manifest_path
+    return outputs
 
 
 def download_industry_membership(
@@ -348,7 +767,7 @@ def run_download_pipeline(
     financial_start = (
         pd.Timestamp(config.start_date) - pd.DateOffset(years=1)
     ).strftime("%Y%m%d")
-    download_financial_statements(
+    financial_outputs = download_financial_statements(
         pro,
         stocks["ts_code"],
         start_date=financial_start,
@@ -370,7 +789,8 @@ def run_download_pipeline(
         "stk_limit_partitions": raw_directory / "stk_limit",
         "suspend_partitions": raw_directory / "suspend_d",
         "stock_st_partitions": raw_directory / "stock_st",
-        "income": raw_directory / "income.parquet",
-        "balancesheet": raw_directory / "balancesheet.parquet",
+        "income": financial_outputs["income"],
+        "balancesheet": financial_outputs["balancesheet"],
+        "financial_manifest": financial_outputs["manifest"],
         "industry_membership": industry_path,
     }

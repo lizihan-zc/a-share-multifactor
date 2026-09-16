@@ -46,6 +46,8 @@ FACTOR_PANEL_CONTEXT_COLUMNS = (
     "is_eligible",
     "is_buyable",
     "is_suspended",
+    "is_gross_profit_applicable",
+    "has_gp_factor_data",
     "industry",
     "market_cap",
 )
@@ -81,7 +83,10 @@ def build_raw_factor_panel(
     factors["ep"] = calculate_earnings_to_price(monthly_panel)
     factors["bp"] = calculate_book_to_price(monthly_panel)
     factors["roe"] = calculate_roe(monthly_panel)
-    factors["gross_profitability"] = calculate_gross_profitability(monthly_panel)
+    factors["gross_profitability"] = calculate_gross_profitability(
+        monthly_panel,
+        applicability_column="is_gross_profit_applicable",
+    )
     extra_columns = ("amount",) if include_optional else ()
     daily = prepare_daily_factor_data(
         cleaned_price_daily, extra_columns=extra_columns
@@ -109,7 +114,11 @@ def build_zscore_factor_panel(
     *,
     factor_columns: Optional[Iterable[str]] = None,
 ) -> pd.DataFrame:
-    """执行 1%/99% 去极值、方向统一和横截面 Z-score 标准化。"""
+    """在 ``is_eligible`` 股票池内执行去极值、方向统一和 Z-score。
+
+    输出保留完整月度骨架和上下文字段，但非研究样本的标准化因子设为缺失，
+    防止 ST、新股、停牌或不可买记录影响研究横截面的变换参数。
+    """
 
     if factor_columns is None:
         factor_columns = tuple(
@@ -118,13 +127,21 @@ def build_zscore_factor_panel(
             if column in raw_factor_panel.columns
         )
     factor_columns = tuple(factor_columns)
+    require_columns(
+        raw_factor_panel,
+        {"is_eligible", *factor_columns},
+        dataset_name="raw_factor_panel",
+    )
     directions = {
         column: DEFAULT_DIRECTIONS[column]
         for column in factor_columns
         if column in DEFAULT_DIRECTIONS
     }
     return preprocess_factor_panel(
-        raw_factor_panel, factor_columns, directions=directions
+        raw_factor_panel,
+        factor_columns,
+        directions=directions,
+        sample_mask=raw_factor_panel["is_eligible"],
     )
 
 

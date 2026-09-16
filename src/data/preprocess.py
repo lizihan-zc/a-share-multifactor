@@ -68,6 +68,12 @@ DEFAULT_PROCESSED_DIRECTORY = PROJECT_ROOT / "data" / "processed"
 # exchange: 交易所
 SH_SZ_EXCHANGES = frozenset({"SSE", "SZSE"})
 GROSS_PROFIT_NOT_APPLICABLE_INDUSTRIES = frozenset({"银行", "非银金融"})
+CORE_DATA_COLUMNS = (
+    "market_cap",
+    "total_assets",
+    "total_equity",
+    "net_profit_ttm",
+)
 
 
 # @dataclass 作用于它紧接着修饰的那个类，在定义时无需声明 __init__
@@ -125,6 +131,31 @@ def read_date_partitions(directory: Path) -> pd.DataFrame:
     if not paths:
         return pd.DataFrame()
     return pd.concat((pd.read_parquet(path) for path in paths), ignore_index=True)
+
+
+def read_financial_partitions(
+    directory: Path,
+    *,
+    legacy_path: Optional[Path] = None,
+) -> pd.DataFrame:
+    """读取逐股票财务分区，并在迁移期间兼容旧版单文件。
+
+    旧单文件排在前面、逐股分区排在后面；完全相同的行会去重，而同一财报版本
+    的更新记录继续保留给后续 point-in-time 版本处理。下载流程完成旧文件迁移后，
+    可以安全删除旧单文件以减少读取开销。
+    """
+
+    directory = Path(directory)
+    paths = sorted(directory.glob("ts_code=*.parquet"))
+    parts: list[pd.DataFrame] = []
+    if legacy_path is not None and Path(legacy_path).is_file():
+        parts.append(pd.read_parquet(legacy_path))
+    parts.extend(pd.read_parquet(path) for path in paths)
+    if not parts:
+        return pd.DataFrame()
+    return pd.concat(parts, ignore_index=True, sort=False).drop_duplicates(
+        ignore_index=True
+    )
 
 
 def select_sh_sz_stock_basic(stock_basic: pd.DataFrame) -> pd.DataFrame:
@@ -904,14 +935,9 @@ def build_monthly_universe(
         & monthly["has_gross_profit_data"]
     )
 
-    core_columns = [
-        "market_cap",
-        "total_assets",
-        "total_equity",
-        "net_profit_ttm",
-        "revenue_ttm",
-    ]
-    monthly["has_core_data"] = monthly[core_columns].notna().all(axis=1)
+    # revenue_ttm 和 gross_profit_ttm 只服务于 GP，缺失时按因子过滤；它们不应
+    # 排除整只股票，尤其不应排除传统 GP 口径不适用的金融行业。
+    monthly["has_core_data"] = monthly[list(CORE_DATA_COLUMNS)].notna().all(axis=1)
     monthly["is_buyable"] = ~monthly["is_one_price_limit_up"].fillna(False)
     monthly["passes_listing_age"] = monthly["listing_trading_days"].ge(
         config.min_listing_trading_days
@@ -995,12 +1021,18 @@ def run_preprocess_pipeline(
     ]
 
     income = stock_filter(
-        pd.read_parquet(raw_directory / "income.parquet"),
+        read_financial_partitions(
+            raw_directory / "income",
+            legacy_path=raw_directory / "income.parquet",
+        ),
         allowed_stock_codes,
     )
 
     balancesheet = stock_filter(
-        pd.read_parquet(raw_directory / "balancesheet.parquet"),
+        read_financial_partitions(
+            raw_directory / "balancesheet",
+            legacy_path=raw_directory / "balancesheet.parquet",
+        ),
         allowed_stock_codes,
     )
 
