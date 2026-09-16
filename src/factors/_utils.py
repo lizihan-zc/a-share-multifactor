@@ -45,64 +45,35 @@ def safe_ratio(
 
     numerator_values = numeric(numerator)
     denominator_values = numeric(denominator)
-    valid = (
-        denominator_values.gt(0)
-        if positive_denominator
-        else denominator_values.ne(0)
-    )
+    if positive_denominator:
+        valid = denominator_values>0
+    else:
+        valid = denominator_values!=0
     result = numerator_values.div(denominator_values.where(valid))
     return result.replace([np.inf, -np.inf], np.nan).rename(name)
 
 
-def validate_factor_index(
-    factor_index: pd.DataFrame,
-    *,
-    dataset_name: str = "factor_index",
-) -> pd.DataFrame:
-    """规范用于把日频因子对齐至月末截面的日期与股票代码。"""
+def build_factor_index(factor_index: pd.DataFrame) -> pd.DataFrame:
+    """提取月末主键并记录原始行序，供日频因子合并后恢复顺序。"""
 
-    require_columns(factor_index, PANEL_KEYS, dataset_name=dataset_name)
     keys = factor_index.loc[:, list(PANEL_KEYS)].copy()
-    keys["date"] = pd.to_datetime(keys["date"], errors="coerce")
-    keys["stock_code"] = keys["stock_code"].astype("string").str.strip().str.upper()
-    if keys["date"].isna().any() or keys["stock_code"].isna().any():
-        raise ValueError(f"{dataset_name} 包含无效的 date 或 stock_code")
-    if keys.duplicated(list(PANEL_KEYS)).any():
-        raise ValueError(f"{dataset_name} 包含重复的 (date, stock_code) 主键")
     keys["_factor_row"] = np.arange(len(keys), dtype=np.int64)
     return keys
 
 
-def prepare_daily_prices(
-    price_daily: pd.DataFrame,
+def prepare_daily_factor_data(
+    cleaned_price_daily: pd.DataFrame,
     *,
-    close_column: str = "close",
-    adjustment_column: str = "adj_factor",
     extra_columns: Iterable[str] = (),
 ) -> pd.DataFrame:
-    """规范日频行情，并添加复权收盘价和全市场交易日序号。
+    """提取因子所需的已清洗日频字段，并添加全市场交易日序号。
 
-    全市场交易日序号由 ``price_daily`` 中出现的全部日期生成。这样回看窗口表示
-    真实的市场交易日，而不是某只股票自身的前若干条记录，避免窗口静默跨过停牌期。
+    输入来自 Notebook 02 保存的清洗后日频面板，因此这里不再重复转换主键、检查
+    重复记录、清洗数值或计算复权收盘价。
     """
 
-    required = {*PANEL_KEYS, close_column, adjustment_column, *extra_columns}
-    require_columns(price_daily, required, dataset_name="price_daily")
-    daily = price_daily.loc[:, list(required)].copy()
-    daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
-    daily["stock_code"] = (
-        daily["stock_code"].astype("string").str.strip().str.upper()
-    )
-    if daily["date"].isna().any() or daily["stock_code"].isna().any():
-        raise ValueError("price_daily 包含无效的 date 或 stock_code")
-    if daily.duplicated(list(PANEL_KEYS)).any():
-        raise ValueError("price_daily 包含重复的 (date, stock_code) 主键")
-
-    close = numeric(daily[close_column])
-    adjustment = numeric(daily[adjustment_column])
-    daily["adjusted_close"] = (close * adjustment).where(
-        close.gt(0) & adjustment.gt(0)
-    )
+    columns = [*PANEL_KEYS, "adjusted_close", *extra_columns]
+    daily = cleaned_price_daily.loc[:, columns].copy()
     sessions = pd.Index(daily["date"].drop_duplicates().sort_values())
     session_map = pd.Series(np.arange(len(sessions), dtype=np.int64), index=sessions)
     daily["_session"] = daily["date"].map(session_map).astype(np.int64)
@@ -127,13 +98,16 @@ def add_strict_rolling_feature(
     daily: pd.DataFrame,
     values: pd.Series,
     *,
-    window: int,
-    min_periods: int,
+    window: int,                # 窗口宽度
+    min_periods: int,           # 窗口中有效值的最少个数
     feature_name: str,
     operation: str,
     ddof: int = 1,
 ) -> pd.DataFrame:
-    """计算滚动统计量，并在完整窗口要求下拒绝跨越交易日缺口。"""
+    """
+    计算滚动统计量，并在完整窗口要求下拒绝跨越交易日缺口。
+    本质上是 Pandas 滚动均值和滚动标准差的严格封装。
+    """
 
     if window < 1:
         raise ValueError("window 必须为正数")
@@ -141,7 +115,7 @@ def add_strict_rolling_feature(
         raise ValueError("min_periods 必须位于 1 和 window 之间")
 
     enriched = daily.copy()
-    enriched["_rolling_input"] = numeric(values)
+    enriched["_rolling_input"] = values
     grouped = enriched.groupby("stock_code", sort=False, observed=True)
     rolling = grouped["_rolling_input"].rolling(
         window=window, min_periods=min_periods
@@ -169,15 +143,17 @@ def align_daily_feature(
     feature_column: str,
     output_name: str,
 ) -> pd.Series:
-    """按精确日期将日频特征对齐到因子截面的原始行序。"""
+    """
+    按日期和股票代码提取月末因子值，并恢复月度面板原有的行顺序。
+    这一步主要是防止因子值计算正确，但赋值时错配到另一只股票或另一个月份。
+    """
 
-    keys = validate_factor_index(factor_index)
+    keys = build_factor_index(factor_index)
     source = daily.loc[:, [*PANEL_KEYS, feature_column]].copy()
     aligned = keys.merge(
         source,
         on=list(PANEL_KEYS),
         how="left",
-        validate="one_to_one",
         sort=False,
     ).sort_values("_factor_row")
     return pd.Series(

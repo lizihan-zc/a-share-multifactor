@@ -1,36 +1,21 @@
-"""过去 3 个月的价格动量因子。"""
+"""过去 3 个月的价格动量因子。
+
+定义：``MOM_3M = P[t] / P[t-63] - 1``，价格使用复权收盘价，63 表示约三个
+月的市场交易日。
+
+作用：衡量股票近期的价格趋势和相对强弱。因子值越高表示过去三个月表现越强，
+可与 12-1 动量比较不同回看周期的有效性和稳定性。
+"""
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-from ._utils import prepare_daily_prices, validate_factor_index
+from ._utils import build_factor_index, prepare_daily_factor_data
 
 
 FACTOR_NAME = "momentum_3m"
-
-
-def calculate_momentum_3m(
-    price_daily: pd.DataFrame,
-    factor_index: pd.DataFrame,
-    *,
-    lookback: int = 63,
-    close_column: str = "close",
-    adjustment_column: str = "adj_factor",
-) -> pd.Series:
-    """使用精确交易日的复权价格计算 ``P[t] / P[t-63] - 1``。"""
-
-    if lookback < 1:
-        raise ValueError("lookback 必须为正数")
-    daily = prepare_daily_prices(
-        price_daily,
-        close_column=close_column,
-        adjustment_column=adjustment_column,
-    )
-    return calculate_momentum_3m_from_prepared(
-        daily, factor_index, lookback=lookback
-    )
 
 
 def calculate_momentum_3m_from_prepared(
@@ -43,7 +28,7 @@ def calculate_momentum_3m_from_prepared(
 
     if lookback < 1:
         raise ValueError("lookback 必须为正数")
-    keys = validate_factor_index(factor_index)
+    keys = build_factor_index(factor_index)
     session_dates = (
         daily.loc[:, ["date", "_session"]]
         .drop_duplicates("_session")
@@ -64,12 +49,10 @@ def calculate_momentum_3m_from_prepared(
         current,
         on=["stock_code", "date"],
         how="left",
-        validate="one_to_one",
     ).merge(
         old,
         on=["stock_code", "_lookback_date"],
         how="left",
-        validate="one_to_one",
     )
     factor = values["_current_price"].div(values["_old_price"]).sub(1)
     factor = factor.replace([np.inf, -np.inf], np.nan)
@@ -79,6 +62,21 @@ def calculate_momentum_3m_from_prepared(
         index=factor_index.index,
         name=FACTOR_NAME,
         dtype="float64",
+    )
+
+
+
+def calculate_momentum_3m(
+    cleaned_price_daily: pd.DataFrame,
+    factor_index: pd.DataFrame,
+    *,
+    lookback: int = 63,
+) -> pd.Series:
+    """使用精确交易日的复权价格计算 ``P[t] / P[t-63] - 1``。"""
+
+    daily = prepare_daily_factor_data(cleaned_price_daily)
+    return calculate_momentum_3m_from_prepared(
+        daily, factor_index, lookback=lookback
     )
 
 

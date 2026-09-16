@@ -18,10 +18,14 @@ from src.factors import (
     calculate_size,
     preprocess_factor_panel,
 )
+from src.factors._utils import add_daily_returns, prepare_daily_factor_data
+from src.factors.amihud_illiquidity import (
+    calculate_amihud_illiquidity_from_prepared,
+)
 
 
 def make_daily(periods: int = 300) -> pd.DataFrame:
-    """构造两只股票具有固定日收益率的合成日频行情。"""
+    """构造两只股票具有固定日收益率的已清洗日频行情。"""
 
     dates = pd.bdate_range("2020-01-01", periods=periods)
     parts = []
@@ -32,8 +36,7 @@ def make_daily(periods: int = 300) -> pd.DataFrame:
                 {
                     "date": dates,
                     "stock_code": stock_code,
-                    "close": 100 * (1 + daily_return) ** step,
-                    "adj_factor": 2.0,
+                    "adjusted_close": 200 * (1 + daily_return) ** step,
                     "amount": 1_000_000.0,
                 }
             )
@@ -129,9 +132,11 @@ def test_low_volatility_and_amihud() -> None:
     index = pd.DataFrame(
         {"date": [last_date, last_date], "stock_code": ["A", "B"]}
     )
+    original_columns = daily.columns.tolist()
 
     lowvol = calculate_low_volatility(daily, index, window=20)
     illiquidity = calculate_amihud_illiquidity(daily, index, window=20)
+    assert daily.columns.tolist() == original_columns
     assert lowvol.abs().max() < 1e-12
     assert illiquidity.iloc[0] == pytest.approx(0.01 / 1_000_000)
     assert illiquidity.iloc[1] == pytest.approx(0.005 / 1_000_000)
@@ -148,6 +153,29 @@ def test_rolling_factors_reject_market_session_gaps() -> None:
 
     assert calculate_low_volatility(daily, index, window=20).isna().all()
     assert calculate_amihud_illiquidity(daily, index, window=20).isna().all()
+
+
+def test_prepared_amihud_does_not_mutate_input() -> None:
+    """验证底层 Amihud 函数不会向调用方的日频表添加临时字段。"""
+
+    daily = add_daily_returns(
+        prepare_daily_factor_data(
+            make_daily(periods=30),
+            extra_columns=("amount",),
+        )
+    )
+    original_columns = daily.columns.tolist()
+    factor_index = pd.DataFrame(
+        {"date": [daily["date"].max()], "stock_code": ["A"]}
+    )
+
+    calculate_amihud_illiquidity_from_prepared(
+        daily,
+        factor_index,
+        window=20,
+    )
+
+    assert daily.columns.tolist() == original_columns
 
 
 def test_preprocessing_is_cross_sectional_and_direction_aware() -> None:

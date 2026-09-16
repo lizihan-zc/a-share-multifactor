@@ -11,7 +11,7 @@ import pandas as pd
 from ._utils import (
     PANEL_KEYS,
     add_daily_returns,
-    prepare_daily_prices,
+    prepare_daily_factor_data,
     require_columns,
 )
 from .amihud_illiquidity import calculate_amihud_illiquidity_from_prepared
@@ -57,7 +57,7 @@ DEFAULT_DIRECTIONS = {
 
 def build_raw_factor_panel(
     monthly_panel: pd.DataFrame,
-    price_daily: pd.DataFrame,
+    cleaned_price_daily: pd.DataFrame,
     *,
     include_optional: bool = True,
     context_columns: Optional[Iterable[str]] = None,
@@ -66,7 +66,7 @@ def build_raw_factor_panel(
 
     ``context_columns`` 默认保留主键、未来收益标签、股票池状态以及行业和市值
     控制变量。行情、财务原始值和中间清洗字段仍保存在源面板中，不在因子面板
-    重复存储。
+    重复存储。``cleaned_price_daily`` 应为 Notebook 02 保存的清洗后日频面板。
     """
 
     if context_columns is None:
@@ -83,7 +83,9 @@ def build_raw_factor_panel(
     factors["roe"] = calculate_roe(monthly_panel)
     factors["gross_profitability"] = calculate_gross_profitability(monthly_panel)
     extra_columns = ("amount",) if include_optional else ()
-    daily = prepare_daily_prices(price_daily, extra_columns=extra_columns)
+    daily = prepare_daily_factor_data(
+        cleaned_price_daily, extra_columns=extra_columns
+    )
     daily = add_daily_returns(daily)
     factors["momentum_12_1"] = calculate_momentum_12_1_from_prepared(
         daily, monthly_panel

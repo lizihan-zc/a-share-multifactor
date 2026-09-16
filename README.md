@@ -270,6 +270,8 @@ announcement_date
 ## 输出
 
 ```text
+data/processed/price_daily_clean.parquet
+data/processed/universe_monthly_clean.parquet
 data/processed/monthly_panel.parquet
 ```
 

@@ -1,6 +1,6 @@
 """Notebook 03 使用的因子计算函数。"""
 
-from .amihud_illiquidity import calculate_amihud_illiquidity, calculate_illiq
+from .amihud_illiquidity import calculate_amihud_illiquidity
 from .book_to_price import calculate_book_to_price, calculate_bp
 from .construction import (
     CORE_FACTOR_COLUMNS,
@@ -46,7 +46,6 @@ __all__ = [
     "calculate_factor_rank_autocorrelation",
     "calculate_gp",
     "calculate_gross_profitability",
-    "calculate_illiq",
     "calculate_low_volatility",
     "calculate_lowvol",
     "calculate_monthly_rank_ic",

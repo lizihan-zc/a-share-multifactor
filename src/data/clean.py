@@ -16,14 +16,17 @@
    检查财务数据只在公告后使用，并确认月频记录对应每月最后一个交易日。
 4. 特殊状态处理：
    ``add_universe_quality_flags`` → ``load_month_end_suspensions``。保留 ST、停牌、
-   新股和涨跌停记录，不静默删除；同时读取月末停牌分区及其日期覆盖，供标签阶段
-   区分终点停牌、退市、行情缺失和原因不明的终点缺失。
+   新股和涨跌停记录，不静默删除；同时读取月末停牌分区及其日期覆盖。标签阶段
+   直接使用月度股票池中的停牌标记，并用分区覆盖状态审计停牌数据是否完整。
 5. 异常收益诊断：
    ``add_return_diagnostics``。使用复权收盘价计算相邻有效行情记录收益，仅标记
    极端值和跨日间隔，不把真实市场极端收益自动删除。
 6. 质量报告：
    ``build_missing_rate_report`` → ``build_special_state_report``。汇总缺失率及特殊
    状态数量，为 Notebook 中的解释和图表提供可审计数据。
+7. 结果保存：
+   ``save_cleaned_panels`` 将清洗后的日频行情和月度股票池原子写入 processed
+   目录，供后续标签和因子 Notebook 直接复用。
 """
 
 from __future__ import annotations
@@ -816,6 +819,27 @@ def run_cleaning_workflow(
     )
 
 
+def save_cleaned_panels(
+    cleaned_price_daily: pd.DataFrame,
+    cleaned_universe_monthly: pd.DataFrame,
+    *,
+    price_daily_path: Path,
+    universe_monthly_path: Path,
+) -> Tuple[Path, Path]:
+    """以原子方式保存清洗后的日频行情和月度股票池。"""
+
+    outputs = (
+        (cleaned_price_daily, Path(price_daily_path)),
+        (cleaned_universe_monthly, Path(universe_monthly_path)),
+    )
+    for frame, path in outputs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.tmp")
+        frame.to_parquet(temporary, index=False)
+        temporary.replace(path)
+    return Path(price_daily_path), Path(universe_monthly_path)
+
+
 __all__ = [
     "CleaningResult",
     "add_point_in_time_flags",
@@ -832,6 +856,7 @@ __all__ = [
     "normalize_datetime_columns",
     "normalize_panel_keys",
     "run_cleaning_workflow",
+    "save_cleaned_panels",
     "validate_monthly_rebalance_dates",
     "validate_point_in_time_financials",
     "validate_required_columns",

@@ -7,8 +7,8 @@
    清洗后月度股票池。
 2. 调用 ``validate_cleaned_universe`` 检查输入字段、主键和清洗标记。
 3. 调用 ``build_next_rebalance_date_map`` 建立相邻正式调仓日映射。
-4. 调用 ``build_label_endpoint_table`` 准备下一调仓日价格，再连接清洗阶段得到的
-   月末停牌记录和停牌分区覆盖表。
+4. 调用 ``build_label_endpoint_table`` 准备下一调仓日价格和停牌状态，再连接清洗
+   阶段得到的停牌分区覆盖表。
 5. 调用 ``calculate_future_return_1m`` 计算复权 close-to-close 简单收益，并通过
    ``classify_label_status`` 将终点问题互斥地标记为停牌、退市、行情缺失或原因
    不明的终点缺失。
@@ -118,24 +118,15 @@ def validate_cleaned_universe(cleaned_universe_monthly: pd.DataFrame) -> None:
         )
 
 
-def validate_month_end_suspension_data(
-    month_end_suspensions: pd.DataFrame,
+def validate_suspension_date_coverage(
     suspension_date_coverage: pd.DataFrame,
 ) -> None:
-    """检查月末停牌记录和分区覆盖表的字段、日期及唯一性。"""
+    """检查停牌分区覆盖表的字段及日期唯一性。"""
 
-    validate_required_columns(
-        month_end_suspensions,
-        {"date", "stock_code", "is_suspended"},
-        dataset_name="month_end_suspensions",
-    )
     validate_required_columns(
         suspension_date_coverage,
         {"date", "suspension_data_available"},
         dataset_name="suspension_date_coverage",
-    )
-    assert_unique_panel_keys(
-        month_end_suspensions, dataset_name="month_end_suspensions"
     )
     duplicated_coverage = suspension_date_coverage["date"].duplicated(keep=False)
     if duplicated_coverage.any():
@@ -217,7 +208,7 @@ def build_label_endpoint_table(
 
     endpoints["has_exit_record"] = True
 
-    endpoints.rename(
+    endpoints = endpoints.rename(
         columns={
             "date": "label_end_date",
             "close": "close_t1",
@@ -234,46 +225,31 @@ def build_label_endpoint_table(
 
 def attach_exit_suspension_status(
     panel: pd.DataFrame,
-    month_end_suspensions: pd.DataFrame,
     suspension_date_coverage: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    把原始月末停牌记录和分区覆盖状态连接到标签终点。
+    使用月度股票池已有的终点停牌状态，并连接停牌分区覆盖状态。
     分区覆盖状态是一个数据完整性审计字段，防止把
     “没有下载到当天停牌数据”误判成“股票没有停牌”。
     """
 
-    validate_month_end_suspension_data(
-        month_end_suspensions, suspension_date_coverage
+    validate_required_columns(
+        panel,
+        {"label_end_date", "is_suspended_t1_from_universe"},
+        dataset_name="标签中间面板",
     )
+    validate_suspension_date_coverage(suspension_date_coverage)
 
     enriched = panel.copy()
 
-    suspension_endpoints = month_end_suspensions[
-        ["date", "stock_code", "is_suspended"]
-    ]
-    suspension_endpoints.rename(
-        columns={
-            "date": "label_end_date",
-            "is_suspended": "has_suspension_record_t1",
-        }
-    )
-
-    coverage_endpoints = suspension_date_coverage[
-        ["date", "suspension_data_available"]
-    ]
-    coverage_endpoints.rename(
-        columns={
-            "date": "label_end_date",
-            "suspension_data_available": "suspension_data_available_t1",
-        }
-    )
-
-    enriched = enriched.merge(
-        suspension_endpoints,
-        on=["label_end_date", "stock_code"],
-        how="left",
-        validate="many_to_one",
+    coverage_endpoints = (
+        suspension_date_coverage[["date", "suspension_data_available"]]
+        .rename(
+            columns={
+                "date": "label_end_date",
+                "suspension_data_available": "suspension_data_available_t1",
+            }
+        )
     )
 
     enriched = enriched.merge(
@@ -283,19 +259,14 @@ def attach_exit_suspension_status(
         validate="many_to_one",
     )
 
-    enriched["has_suspension_record_t1"] = _fill_boolean_missing_with_false(
-        enriched["has_suspension_record_t1"]
-    )
-
+    # 标签终点 label_end_date 当天的原始停牌数据分区是否存在。
     enriched["suspension_data_available_t1"] = _fill_boolean_missing_with_false(
         enriched["suspension_data_available_t1"]
     )
 
-    enriched["is_suspended_t1"] = (
-        _fill_boolean_missing_with_false(
-            enriched["is_suspended_t1_from_universe"]
-        )
-        | enriched["has_suspension_record_t1"]
+    # 股票在标签终点是否停牌
+    enriched["is_suspended_t1"] = _fill_boolean_missing_with_false(
+        enriched["is_suspended_t1_from_universe"]
     )
     
     return enriched
@@ -391,15 +362,12 @@ def classify_label_status(panel: pd.DataFrame) -> pd.Series:
 
 def calculate_future_return_1m(
     cleaned_universe_monthly: pd.DataFrame,
-    month_end_suspensions: pd.DataFrame,
     suspension_date_coverage: pd.DataFrame,
 ) -> pd.DataFrame:
     """连接月末价格和停牌状态，计算 future_return_1m 及审计字段。"""
 
     validate_cleaned_universe(cleaned_universe_monthly)
-    validate_month_end_suspension_data(
-        month_end_suspensions, suspension_date_coverage
-    )
+    validate_suspension_date_coverage(suspension_date_coverage)
     panel = cleaned_universe_monthly.copy()
     panel["date"] = pd.to_datetime(panel["date"])
     panel["list_date"] = pd.to_datetime(panel["list_date"], errors="coerce")
@@ -422,7 +390,6 @@ def calculate_future_return_1m(
     )
     panel = attach_exit_suspension_status(
         panel,
-        month_end_suspensions,
         suspension_date_coverage,
     )
 
@@ -449,14 +416,12 @@ def calculate_future_return_1m(
 
 def build_monthly_panel(
     cleaned_universe_monthly: pd.DataFrame,
-    month_end_suspensions: pd.DataFrame,
     suspension_date_coverage: pd.DataFrame,
 ) -> pd.DataFrame:
     """合并月末停牌信息，保留清洗字段并构造最终 monthly_panel。"""
 
     panel = calculate_future_return_1m(
         cleaned_universe_monthly,
-        month_end_suspensions,
         suspension_date_coverage,
     )
     assert_unique_panel_keys(panel, dataset_name="monthly_panel")
@@ -547,5 +512,5 @@ __all__: Iterable[str] = [
     "label_status_counts",
     "save_monthly_panel",
     "validate_cleaned_universe",
-    "validate_month_end_suspension_data",
+    "validate_suspension_date_coverage",
 ]
