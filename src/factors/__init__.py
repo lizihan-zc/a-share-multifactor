@@ -21,6 +21,10 @@ from .gross_profitability import calculate_gp, calculate_gross_profitability
 from .low_volatility import calculate_low_volatility, calculate_lowvol
 from .momentum_12_1 import calculate_mom_12_1, calculate_momentum_12_1
 from .momentum_3m import calculate_mom_3m, calculate_momentum_3m
+from .neutralization import (
+    build_neutralized_factor_panel,
+    neutralize_cross_section,
+)
 from .preprocessing import (
     preprocess_factor_panel,
     winsorize_cross_section,
@@ -35,6 +39,7 @@ __all__ = [
     "FACTOR_PANEL_CONTEXT_COLUMNS",
     "OPTIONAL_FACTOR_COLUMNS",
     "build_raw_factor_panel",
+    "build_neutralized_factor_panel",
     "build_zscore_factor_panel",
     "calculate_average_factor_correlation",
     "calculate_amihud_illiquidity",
@@ -56,6 +61,7 @@ __all__ = [
     "calculate_roe",
     "calculate_size",
     "preprocess_factor_panel",
+    "neutralize_cross_section",
     "save_factor_panels",
     "summarize_rank_ic",
     "winsorize_cross_section",

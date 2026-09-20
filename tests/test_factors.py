@@ -9,6 +9,7 @@ import pytest
 from src.factors import (
     build_raw_factor_panel,
     build_zscore_factor_panel,
+    build_neutralized_factor_panel,
     calculate_amihud_illiquidity,
     calculate_book_to_price,
     calculate_earnings_to_price,
@@ -279,3 +280,91 @@ def test_zscore_panel_uses_is_eligible_without_dropping_context_rows() -> None:
     assert eligible.mean() == pytest.approx(0)
     assert eligible.std(ddof=0) == pytest.approx(1)
     assert result.loc[~result["is_eligible"], "ep"].isna().all()
+
+
+def make_neutralization_panel() -> pd.DataFrame:
+    """构造包含两个日期、市值和行业结构的中性化测试面板。"""
+
+    rows = []
+    residual_pattern = np.array([1.0, -1.0, -1.0, 1.0, 0.5, -0.5])
+    for date, shift in [("2020-01-31", 0.0), ("2020-02-28", 1.0)]:
+        size = np.arange(1.0, 7.0)
+        industry = np.array(["A", "A", "A", "B", "B", "B"])
+        industry_effect = np.where(industry == "A", 3.0, -2.0)
+        factor = 2.5 * size + industry_effect + residual_pattern + shift
+        for position in range(6):
+            rows.append(
+                {
+                    "date": pd.Timestamp(date),
+                    "stock_code": f"S{position}",
+                    "is_eligible": position < 5,
+                    "size": size[position],
+                    "industry": industry[position],
+                    "ep": factor[position],
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_size_neutralized_panel_is_orthogonal_and_preserves_skeleton() -> None:
+    """验证市值中性化逐月消除线性市值暴露并保留完整面板骨架。"""
+
+    raw = make_neutralization_panel()
+    result = build_neutralized_factor_panel(
+        raw,
+        factor_columns=["ep"],
+        neutralize_size=True,
+        neutralize_industry=False,
+        min_observations=4,
+    )
+
+    assert result[["date", "stock_code"]].equals(raw[["date", "stock_code"]])
+    assert result.loc[~result["is_eligible"], "ep"].isna().all()
+    eligible = result.loc[result["is_eligible"]].copy()
+    by_date = eligible.groupby("date", observed=True)
+    assert np.allclose(by_date["ep"].mean(), 0, atol=1e-12)
+    assert np.allclose(by_date["ep"].std(ddof=0), 1, atol=1e-12)
+    for _, cross_section in by_date:
+        assert cross_section["ep"].corr(cross_section["size"]) == pytest.approx(
+            0, abs=1e-12
+        )
+
+
+def test_industry_neutralized_panel_has_zero_industry_means() -> None:
+    """验证行业中性化后的因子在每个月、每个行业内均值为零。"""
+
+    raw = make_neutralization_panel()
+    result = build_neutralized_factor_panel(
+        raw,
+        factor_columns=["ep"],
+        neutralize_size=False,
+        neutralize_industry=True,
+        min_observations=4,
+    )
+    eligible = result.loc[result["is_eligible"]]
+    industry_means = eligible.groupby(
+        ["date", "industry"], observed=True
+    )["ep"].mean()
+
+    assert np.allclose(industry_means, 0, atol=1e-12)
+
+
+def test_joint_neutralized_panel_removes_size_and_industry_exposure() -> None:
+    """验证市值加行业联合中性化同时满足两类 OLS 正交条件。"""
+
+    raw = make_neutralization_panel()
+    result = build_neutralized_factor_panel(
+        raw,
+        factor_columns=["ep"],
+        neutralize_size=True,
+        neutralize_industry=True,
+        min_observations=4,
+    )
+    eligible = result.loc[result["is_eligible"]]
+
+    for _, cross_section in eligible.groupby("date", observed=True):
+        assert cross_section["ep"].corr(cross_section["size"]) == pytest.approx(
+            0, abs=1e-12
+        )
+        industry_means = cross_section.groupby("industry", observed=True)["ep"].mean()
+        assert np.allclose(industry_means, 0, atol=1e-12)
