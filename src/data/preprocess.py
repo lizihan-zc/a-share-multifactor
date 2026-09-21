@@ -4,12 +4,13 @@
 price_daily:
     日频面板是实际行情记录的事实层，主要回答某只股票在有行情的交易日发生了什么。
     它包含主键（日期、股票代码）、OHLC、前收盘价、成交量、成交额、复权因子、
-    市值、涨跌停价格和一字涨跌停标记。全天停牌等没有日线行情的股票不一定有记录。
+    市值、涨跌停价格和一字涨跌停标记。(Tushare 还提供了一个 limit_status=float
+    统一标记停牌状态) 全天停牌等没有日线行情的股票不一定有记录。
 
 universe_monthly:
     月度股票池关注月末调仓日当时已知的信息，以及股票是否可以进入研究样本和
-    投资组合。它以调仓日和上市区间内股票的完整骨架为基础，包含月末行情、股票
-    身份和上市退市信息、ST 与停牌状态、历史行业、point-in-time 财务数据及股票池
+    投资组合。它以调仓日和上市区间内股票的完整骨架为基础，包含股票
+    身份、上市退市信息、ST 与停牌状态、月末行情、历史行业、财务数据及股票池
     筛选字段。没有月末行情的股票仍保留，并通过 ``has_price_record`` 标记。
 
 构建思路：
@@ -17,9 +18,19 @@ universe_monthly:
     ``adj_factor``、``daily_basic`` 和 ``stk_limit``。
 
     月度股票池骨架先从交易日历取得每个自然月最后一个开市日，再与股票基础信息做直积，
-    并按 ``list_date`` 和 ``delist_date`` 保留理论上市记录。随后按 
-    ``["date", "stock_code"]`` 左连接月末行情、ST、停牌、point-in-time 财务快照和
-    历史行业，最后计算数据可用性、可交易性及``is_eligible``。
+    并按 ``list_date`` 和 ``delist_date`` 筛选在市股票 (并记录字段 is_listed)。 
+    随后按 ``["date", "stock_code"]`` 左连接月末行情、ST、停牌、point-in-time
+    财务快照和历史行业，最后计算股票池资格字段``is_eligible``，它由 8 个字段共同决定：
+    is_listed, has_price_record, passes_listing_age, passes_liquidity,
+    is_buyable, ~is_st, ~is_suspended, has_core_data.
+
+    此外，净利润(GP)不适用于金融行业，所以我们定义一些 GP 可用性字段：
+    has_gp_factor_data = is_gross_profit_applicable & has_gross_profit_data.
+
+潜在问题：
+    当前代码采用了比较保守的“只排除明确无法成交状态”的规则，所以只将一字涨停视为不可买入，
+    而不排除普通涨停。但如果信号使用月末收盘信息，那么盘中曾经可以买到并不能证明收盘后还能买到，
+    普通收盘涨停也可能无法建仓。因此，当前规则适合解释为月度研究样本中的最低限度可买性过滤。
 
 预处理数据的工作流：
 
@@ -609,6 +620,7 @@ def _calculate_financial_snapshot_as_of(
         validate="one_to_one",
     )
 
+    # 多份报表的公告日
     availability_columns = [
         "current_income_announcement_date",
         "prior_same_announcement_date",
@@ -616,6 +628,7 @@ def _calculate_financial_snapshot_as_of(
         "balance_announcement_date",
     ]
 
+    # 所有相关公告日期的最大值，是财务指标完整可用的日期
     snapshot["financial_available_date"] = snapshot[
         availability_columns
     ].max(axis=1)
@@ -820,7 +833,10 @@ def build_monthly_universe(
             "请在构建日频面板时使用沪深股票白名单。"
         )
 
+    month_end_prices["has_price_record"] = True
+
     # 先构造完整的月末股票骨架，再按上市区间保留理论有效记录。
+    # 月末没有行情的停牌股票仍保留在骨架中。
     monthly = rebalance_dates.merge(stock_information, how="cross")
 
     monthly["is_listed"] = (monthly["date"]>=monthly["list_date"]) & (
@@ -829,9 +845,6 @@ def build_monthly_universe(
     )
 
     monthly = monthly.loc[monthly["is_listed"]].copy()
-
-    # 行情只是月度股票池的属性；月末没有行情的停牌股票仍保留在骨架中。
-    month_end_prices["has_price_record"] = True
 
     # 合并后月末有交易记录的 has_price_record 自动为 True
     monthly = monthly.merge(
@@ -935,8 +948,8 @@ def build_monthly_universe(
         & monthly["has_gross_profit_data"]
     )
 
-    # revenue_ttm 和 gross_profit_ttm 只服务于 GP，缺失时按因子过滤；它们不应
-    # 排除整只股票，尤其不应排除传统 GP 口径不适用的金融行业。
+    # revenue_ttm 和 gross_profit_ttm 只服务于 GP，缺失时按因子过滤；
+    # 它们不应排除整只股票，尤其不应排除传统 GP 口径不适用的金融行业。
     monthly["has_core_data"] = monthly[list(CORE_DATA_COLUMNS)].notna().all(axis=1)
     monthly["is_buyable"] = ~monthly["is_one_price_limit_up"].fillna(False)
     monthly["passes_listing_age"] = monthly["listing_trading_days"].ge(
