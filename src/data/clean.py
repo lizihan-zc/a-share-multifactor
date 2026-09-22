@@ -497,6 +497,7 @@ def add_universe_quality_flags(universe_monthly: pd.DataFrame) -> pd.DataFrame:
         & cleaned["passes_listing_age"].fillna(False)
         & cleaned["passes_liquidity"].fillna(False)
         & cleaned["has_core_data"].fillna(False)
+        & cleaned["has_price_record"].fillna(False)
     )
 
     cleaned["eligibility_rule_inconsistent"] = (
@@ -507,7 +508,6 @@ def add_universe_quality_flags(universe_monthly: pd.DataFrame) -> pd.DataFrame:
 
     cleaned["is_entry_blocked"] = (
         cleaned["is_suspended"].fillna(False)
-        | cleaned["is_one_price_limit_up"].fillna(False)
         | ~cleaned["is_buyable"].fillna(False)
     )
 
@@ -523,9 +523,9 @@ def add_universe_quality_flags(universe_monthly: pd.DataFrame) -> pd.DataFrame:
 
     cleaned["is_clean_for_label"] = (
         cleaned["is_eligible"].fillna(False)
+        & ~cleaned["eligibility_rule_inconsistent"]
         & cleaned["has_valid_label_price"]
         & ~cleaned["has_future_financial_data"]
-        & ~cleaned["eligibility_rule_inconsistent"]
     )
 
     return cleaned
