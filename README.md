@@ -597,8 +597,6 @@ $$
 
 文件：`notebooks/06_neutralization_and_robustness.ipynb`
 
-这是很能拉开“课程项目”和“研究项目”差距的一步。
-
 ## 6.1 市值中性化
 
 对原始因子做横截面回归：
@@ -607,7 +605,7 @@ $$
 f_i=\alpha+\beta\ln(MarketCap_i)+\epsilon_i
 $$
 
-使用残差：
+使用残差作为中性化因子，相当于扣除了市值的影响：
 
 $$
 f_i^{neutral}=\epsilon_i

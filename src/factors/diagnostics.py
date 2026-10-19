@@ -94,8 +94,9 @@ def summarize_rank_ic(monthly_rank_ic: pd.DataFrame) -> pd.DataFrame:
             "Months": count.astype("int64"),
         }
     )
-    summary.index.name = "Factor"
-    return summary
+    # summary 的索引可能与输入表的列索引共享对象；重新命名索引而非原地修改，
+    # 避免汇总一次 IC 后，调用方原来的月度 IC 表也被悄悄改了列轴名称。
+    return summary.rename_axis("Factor")
 
 
 def calculate_average_factor_correlation(

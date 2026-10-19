@@ -59,6 +59,14 @@ def test_monthly_rank_ic_and_summary() -> None:
     )
 
 
+def test_ic_summary_does_not_rename_input_columns() -> None:
+    monthly = pd.DataFrame({"ep": [0.1, 0.2], "roe": [-0.1, 0.3]})
+    before = monthly.copy(deep=True)
+    summary = summarize_rank_ic(monthly)
+    pd.testing.assert_frame_equal(monthly, before)
+    assert summary.index.name == "Factor"
+
+
 def test_rank_ic_uses_pairwise_complete_observations() -> None:
     panel = make_diagnostic_panel()
     panel.loc[
