@@ -39,8 +39,7 @@ a-share-multifactor/
 │   ├── 05_single_factor_backtest.ipynb
 │   ├── 06_neutralization_and_robustness.ipynb
 │   ├── 07_multifactor_combination.ipynb
-│   ├── 08_portfolio_backtest.ipynb
-│   ├── 09_transaction_costs_and_constraints.ipynb
+│   ├── 08_09_portfolio_backtest_and_constraints.ipynb
 │   └── 10_out_of_sample_analysis.ipynb
 ├── src/
 │   ├── data/
@@ -704,9 +703,13 @@ ICIR Weight
 
 # Notebook 08：组合构建与回测
 
-文件：`notebooks/08_portfolio_backtest.ipynb`
+文件：[notebooks/08_09_portfolio_backtest_and_constraints.ipynb](notebooks/08_09_portfolio_backtest_and_constraints.ipynb)（合并实现 08 与 09）。
 
 把预测信号正式转换成投资组合。
+
+当前实现读取 07 的四种评分，使用共同完整信号股票池；月末收盘生成目标，下一市场交易日开盘先卖后买，逐日跟踪持仓、现金与净值。主策略为 Top 20% 等权，并固定比较 Top 10%、单因子、IC 与 ICIR 评分。基准为同候选股票池等权，同时提供毛收益基准和 20bps＋涨跌停限制基准。
+
+可复用账户逻辑位于 `src/portfolio/backtest.py`；手算测试为 `python -m pytest tests/test_portfolio_backtest.py -q`。执行 notebook 后，明细保存在 `data/processed/portfolio_08_09/`，图保存在 `figures/portfolio_08_09_*.png`，运行记录为 `reports/08_09_portfolio_backtest_and_constraints.md`。下方公式是原研究计划；实际实现使用日频 252 年化、算术平均收益 Sharpe（Rf=0），并将初始资金纳入最大回撤计算。
 
 ## Baseline Portfolio
 
@@ -766,7 +769,9 @@ $$
 
 # Notebook 09：交易成本与现实约束
 
-文件：`notebooks/09_transaction_costs_and_constraints.ipynb`
+文件：[notebooks/08_09_portfolio_backtest_and_constraints.ipynb](notebooks/08_09_portfolio_backtest_and_constraints.ipynb)（与 08 共用同一个账户引擎）。
+
+当前实现对实际双边成交额测试 0/10/20/50bps 综合费率，比较开盘涨停禁买／跌停禁卖、信号日 ADV20 至少 2000 万元、前日 ADV20 的 1% 单股交易容量、1000 万／1 亿元初始资金，以及每 1/2/3 个月调仓。卖不出部分逐日重试，买不成部分取消并留现金。缺少行情的旧仓按历史价格向前估值并报告陈旧权重，退市剩余仓位采用明确的零回收压力假设核销。连续复权单位、保守限价规则及统一 bps 都属于研究近似，不代表真实撮合或实际历史费率。
 
 这一 notebook 向面试官展示：
 
@@ -775,8 +780,10 @@ $$
 ## 9.1 简化交易成本模型
 
 $$
-Cost_t=Turnover_t\times c
+Cost_t=(BuyNotional_t+SellNotional_t)\times c/10000
 $$
+
+这里 `c` 的单位是每侧成交费率 bps。实际单边换手为 `0.5 × 双边成交额 / 开盘交易前 NAV`，包含首次建仓与延迟卖单；因此费用占交易前 NAV 的比例是 `2 × 单边换手 × c / 10000`。
 
 测试多组假设：
 

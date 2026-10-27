@@ -1,4 +1,4 @@
-"""Notebook 07：等权合成与只使用已实现收益的滚动 IC 加权。
+"""Notebook 07：等权合成与只使用已实现收益的滚动 IC / ICIR 加权。
 
 输入约定沿用 Notebook 03/06：日期是正式月末调仓日，因子已经去极值、
 统一方向并标准化；每个股票—日期只有一条记录。这里不重复清洗上游数据。
@@ -66,9 +66,54 @@ def calculate_rolling_ic_weights(
     历史不足或所有平均 IC 为零时整行留空，不偷偷回退到等权。
     """
 
+    return _calculate_rolling_weights(
+        monthly_ic, ic_available_dates, signal_dates,
+        window=window, min_history=min_history, method="ic",
+    )
+
+
+def calculate_rolling_icir_weights(
+    monthly_ic: pd.DataFrame,
+    ic_available_dates: pd.Series,
+    signal_dates: pd.DatetimeIndex,
+    *,
+    window: int = 36,
+    min_history: Optional[int] = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """用历史 ICIR 分配因子权重；时间窗口与滚动 IC 加权完全一致。
+
+    每个因子的 ICIR = 历史 IC 均值 / IC 样本标准差（ddof=1），不年化；
+    再除以所有因子 ICIR 绝对值之和。允许负权重，含义与 IC 加权相同。
+    更稳定的 IC 序列会在相同平均 IC 下获得更大的绝对权重。
+
+    标准差至少需要两个有效月份。只要一个因子的标准差为零或无法估计，
+    当月整组权重就留空，不删除该因子，也不回退为等权或 IC 加权。
+    对很小但仍为正的标准差不另设截断参数，避免引入事后调参；其可能
+    导致集中配置，应结合权重图观察。审计表额外保留最小 IC 标准差和
+    所有因子标准差是否可用，区分预热不足与 ICIR 分母无法识别。
+    """
+
+    return _calculate_rolling_weights(
+        monthly_ic, ic_available_dates, signal_dates,
+        window=window, min_history=min_history, method="icir",
+    )
+
+
+def _calculate_rolling_weights(
+    monthly_ic: pd.DataFrame,
+    ic_available_dates: pd.Series,
+    signal_dates: pd.DatetimeIndex,
+    *,
+    window: int,
+    min_history: Optional[int],
+    method: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """共用收益可得日筛选与窗口审计，只在因子权重的估计量上区分方法。"""
+
     min_history = window if min_history is None else min_history
-    if not 1 <= min_history <= window:
-        raise ValueError("必须满足 1 <= min_history <= window")
+    minimum = 2 if method == "icir" else 1
+    if not minimum <= min_history <= window:
+        raise ValueError(f"必须满足 {minimum} <= min_history <= window")
 
     ic = monthly_ic.sort_index()
     available_dates = pd.to_datetime(ic_available_dates.reindex(ic.index))
@@ -83,14 +128,26 @@ def calculate_rolling_ic_weights(
         known = available_dates.notna() & available_dates.le(date) & (ic.index < date)
         history = ic.loc[known].tail(window)
         valid_counts = history.count()
-        mean_ic = history.mean()
-        scale = mean_ic.abs().sum()
-        ready = bool(valid_counts.ge(min_history).all() and scale > 0)
+        raw_weights = history.mean()
+        if method == "icir":
+            # 标准差只来自当前历史窗口；不能用全样本波动率缩放过去的权重。
+            ic_std = history.std(ddof=1)
+            # 完全相同的浮点数（如三个 0.2）也可能算出极小的非零标准差。
+            # 直接识别常数序列，防止把舍入误差误认成极高的稳定性。
+            constant = valid_counts.ge(2) & history.nunique().eq(1)
+            ic_std = ic_std.mask(constant, 0.0)
+            raw_weights = raw_weights.div(ic_std.where(ic_std.gt(0)))
+        scale = raw_weights.abs().sum()
+        ready = bool(
+            valid_counts.ge(min_history).all()
+            and np.isfinite(raw_weights).all()
+            and scale > 0
+        )
         if ready:
-            weights.loc[date] = mean_ic / scale
+            weights.loc[date] = raw_weights / scale
 
         # 保留实际使用的起止月份与最近收益实现日，便于直接审核时间对齐。
-        audit_rows.append({
+        row = {
             "date": date,
             "history_start": history.index.min(),
             "history_end": history.index.max(),
@@ -98,7 +155,11 @@ def calculate_rolling_ic_weights(
             "n_periods": len(history),
             "min_valid_ic_months": int(valid_counts.min()),
             "is_ready": ready,
-        })
+        }
+        if method == "icir":
+            row["min_ic_std"] = ic_std.min()
+            row["has_valid_ic_std"] = bool(ic_std.notna().all() and ic_std.gt(0).all())
+        audit_rows.append(row)
 
     audit = pd.DataFrame(audit_rows).set_index("date")
     return weights, audit
